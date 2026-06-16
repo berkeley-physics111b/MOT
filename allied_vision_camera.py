@@ -59,11 +59,18 @@ from vmbpy import (
 # ---------------------------------------------------------------------------
 # Module-level Python logger (separate from the Vimba X internal log)
 # ---------------------------------------------------------------------------
+# Library modules should not force a logging configuration on the whole
+# application (it can override what the caller already set up, and a
+# DEBUG-level basicConfig here was previously causing console output —
+# and the I/O cost that comes with it — on every routine call).
+#
+# Instead: NullHandler so nothing prints by default unless the application
+# (or this module's __main__ demo block) explicitly configures logging.
+# Only WARNING and above are ever emitted by this module's own logger calls;
+# routine status messages use DEBUG so they're silent unless the caller
+# turns them on.
 _log = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+_log.addHandler(logging.NullHandler())
 
 
 # ---------------------------------------------------------------------------
@@ -103,8 +110,12 @@ class CameraConfig:
     # Optional path to save / load camera settings XML.
     settings_file: Optional[Path] = None
 
-    # Vimba X log level constant.  None → no Vimba X-level logging.
-    vmb_log_config: object = field(default=LOG_CONFIG_WARNING_CONSOLE_ONLY)
+    # Vimba X log level constant.  None = no Vimba X-level logging (default).
+    # Vimba X's own console logger performs synchronous console I/O on every
+    # event it reports, which previously added latency during streaming.
+    # Set to LOG_CONFIG_WARNING_CONSOLE_ONLY explicitly if you need to see
+    # SDK-level warnings while debugging.
+    vmb_log_config: object = None
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +268,6 @@ class AlliedVisionCamera:
         # Enable Vimba X internal logging
         if self._config.vmb_log_config is not None:
             self._vmb.enable_log(self._config.vmb_log_config)
-            _log.info("Vimba X logging enabled.")
 
         # Register connection / disconnection hooks
         self._vmb.register_camera_change_handler(self._on_camera_change)
@@ -277,10 +287,10 @@ class AlliedVisionCamera:
             self._cam = matching[0]
         else:
             self._cam = cameras[0]
-            _log.info("No camera_id specified; using first detected: %s", self._cam.get_id())
+            _log.debug("No camera_id specified; using first detected: %s", self._cam.get_id())
 
         self._cam.__enter__()
-        _log.info("Opened camera: %s  model: %s", self._cam.get_id(), self._cam.get_model())
+        _log.debug("Opened camera: %s  model: %s", self._cam.get_id(), self._cam.get_model())
 
         # Optionally load saved settings before applying overrides
         if self._config.settings_file and self._config.settings_file.exists():
@@ -312,7 +322,7 @@ class AlliedVisionCamera:
                 _log.warning("Exception while shutting down VmbSystem: %s", exc)
             self._vmb = None
 
-        _log.info("Camera interface closed.")
+        _log.debug("Camera interface closed.")
 
     def __enter__(self) -> "AlliedVisionCamera":
         return self.open()
@@ -334,7 +344,7 @@ class AlliedVisionCamera:
             supported = cam.get_pixel_formats()
             if cfg.pixel_format in supported:
                 cam.set_pixel_format(cfg.pixel_format)
-                _log.info("Pixel format set to %s", cfg.pixel_format)
+                _log.debug("Pixel format set to %s", cfg.pixel_format)
             else:
                 _log.warning(
                     "Requested pixel format %s not supported. Supported: %s",
@@ -390,7 +400,7 @@ class AlliedVisionCamera:
             if height is not None:
                 cam.Height.set(height)
 
-            _log.info(
+            _log.debug(
                 "ROI: OffsetX=%s OffsetY=%s Width=%s Height=%s",
                 cam.OffsetX.get(),
                 cam.OffsetY.get(),
@@ -438,7 +448,7 @@ class AlliedVisionCamera:
                     microseconds, min_val, max_val, clamped,
                 )
             feat.set(clamped)
-            _log.info("Exposure time set to %.1f µs", clamped)
+            _log.debug("Exposure time set to %.1f µs", clamped)
             self._config.exposure_time_us = clamped
         except Exception as exc:  # noqa: BLE001
             _log.warning("Could not set exposure time: %s", exc)
@@ -455,7 +465,7 @@ class AlliedVisionCamera:
                     value, min_val, max_val, clamped,
                 )
             feat.set(clamped)
-            _log.info("Gain set to %.3f", clamped)
+            _log.debug("Gain set to %.3f", clamped)
             self._config.gain = clamped
         except Exception as exc:  # noqa: BLE001
             _log.warning("Could not set gain: %s", exc)
@@ -470,7 +480,7 @@ class AlliedVisionCamera:
             try:
                 feat = getattr(cam, feat_name)
                 feat.set(value)
-                _log.info("%s set to %.3f", feat_name, value)
+                _log.debug("%s set to %.3f", feat_name, value)
                 self._config.brightness = value
                 return
             except Exception:  # noqa: BLE001
@@ -486,7 +496,7 @@ class AlliedVisionCamera:
             raise ValueError(f"Pixel format {fmt} not supported. Supported: {supported}")
         self._cam.set_pixel_format(fmt)
         self._config.pixel_format = fmt
-        _log.info("Pixel format changed to %s", fmt)
+        _log.debug("Pixel format changed to %s", fmt)
 
     # ------------------------------------------------------------------
     # Continuous streaming  (non-critical timing – for live display)
@@ -520,7 +530,7 @@ class AlliedVisionCamera:
 
             cam.start_streaming(self._continuous_frame_handler, buffer_count=self._config.stream_buffer_count)
             self._streaming = True
-            _log.info("Continuous streaming started.")
+            _log.debug("Continuous streaming started.")
 
     def stop_continuous(self) -> None:
         """Stop asynchronous frame acquisition."""
@@ -533,7 +543,7 @@ class AlliedVisionCamera:
                 _log.warning("Exception stopping stream: %s", exc)
             self._streaming = False
             self._continuous_callback = None
-            _log.info("Continuous streaming stopped.")
+            _log.debug("Continuous streaming stopped.")
 
     def _continuous_frame_handler(self, cam: Camera, stream: Stream, frame: Frame) -> None:
         """Internal callback invoked by VmbPy for each incoming frame."""
@@ -621,7 +631,7 @@ class AlliedVisionCamera:
                 f"Snapshot timed out after {self._config.snapshot_timeout_s} s."
             )
 
-        _log.info("Snapshot acquired successfully.")
+        _log.debug("Snapshot acquired successfully.")
         return self._snapshot_frame
 
     def _snapshot_frame_handler(self, cam: Camera, stream: Stream, frame: Frame) -> None:
@@ -719,7 +729,7 @@ class AlliedVisionCamera:
         try:
             cam.LineSelector.set(hw_config.line)
             cam.LineMode.set("Input")
-            _log.info("GPIO %s set to Input.", hw_config.line)
+            _log.debug("GPIO %s set to Input.", hw_config.line)
         except Exception as exc:  # noqa: BLE001
             _log.warning(
                 "Could not configure line direction for %s: %s  "
@@ -731,7 +741,7 @@ class AlliedVisionCamera:
         if hw_config.debounce_us is not None:
             try:
                 cam.LineDebouncerTime.set(hw_config.debounce_us)
-                _log.info("Line debounce set to %.1f µs.", hw_config.debounce_us)
+                _log.debug("Line debounce set to %.1f µs.", hw_config.debounce_us)
             except Exception as exc:  # noqa: BLE001
                 _log.warning("Could not set line debounce: %s", exc)
 
@@ -741,7 +751,7 @@ class AlliedVisionCamera:
             cam.TriggerSource.set(hw_config.line)
             cam.TriggerActivation.set(hw_config.activation.value)
             cam.TriggerMode.set("On")
-            _log.info(
+            _log.debug(
                 "Hardware trigger: selector=%s  source=%s  activation=%s",
                 hw_config.selector.value,
                 hw_config.line,
@@ -754,7 +764,7 @@ class AlliedVisionCamera:
         if hw_config.trigger_delay_us is not None:
             try:
                 cam.TriggerDelay.set(hw_config.trigger_delay_us)
-                _log.info("Trigger delay set to %.1f µs.", hw_config.trigger_delay_us)
+                _log.debug("Trigger delay set to %.1f µs.", hw_config.trigger_delay_us)
             except Exception as exc:  # noqa: BLE001
                 _log.warning("Could not set trigger delay: %s", exc)
 
@@ -763,7 +773,7 @@ class AlliedVisionCamera:
             cam.AcquisitionMode.set(hw_config.acquisition_mode.value)
             if hw_config.acquisition_mode == AcquisitionMode.MULTI_FRAME:
                 cam.AcquisitionFrameCount.set(hw_config.frame_count)
-                _log.info("Multi-frame count: %d", hw_config.frame_count)
+                _log.debug("Multi-frame count: %d", hw_config.frame_count)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"Failed to set acquisition mode: {exc}") from exc
 
@@ -775,7 +785,7 @@ class AlliedVisionCamera:
         cam.start_streaming(self._hw_frame_handler, buffer_count=buffer_count)
         self._hw_trigger_armed = True
 
-        _log.info(
+        _log.debug(
             "Hardware trigger armed on %s (%s).  "
             "Camera is waiting for external signal.",
             hw_config.line,
@@ -811,7 +821,7 @@ class AlliedVisionCamera:
             raise RuntimeError("Call arm_hardware_trigger() first.")
 
         t = timeout_s if timeout_s is not None else self._hw_trigger_config.timeout_s
-        _log.info("Waiting for hardware trigger (timeout=%.1f s) …", t)
+        _log.debug("Waiting for hardware trigger (timeout=%.1f s) …", t)
 
         got_frame = self._hw_frame_event.wait(timeout=t)
         if not got_frame:
@@ -827,7 +837,7 @@ class AlliedVisionCamera:
             if not self._hw_frame_queue:
                 self._hw_frame_event.clear()   # reset for next wait in CONTINUOUS mode
 
-        _log.info("Hardware-triggered frame received.")
+        _log.debug("Hardware-triggered frame received.")
         return img
 
     def disarm_hardware_trigger(self) -> None:
@@ -857,7 +867,7 @@ class AlliedVisionCamera:
             self._hw_frame_queue.clear()
         self._hw_frame_event.clear()
 
-        _log.info("Hardware trigger disarmed.")
+        _log.debug("Hardware trigger disarmed.")
 
     def _hw_frame_handler(self, cam: Camera, stream: Stream, frame: Frame) -> None:
         """Internal VmbPy callback for hardware-triggered frames."""
@@ -942,7 +952,7 @@ class AlliedVisionCamera:
         """Save all camera feature values to an XML file on the host PC."""
         path = Path(path)
         self._cam.save_settings(str(path), PersistType.All)
-        _log.info("Camera settings saved to %s", path)
+        _log.debug("Camera settings saved to %s", path)
 
     def load_settings(self, path: Path) -> None:
         """Load camera feature values from a previously saved XML file."""
@@ -950,7 +960,7 @@ class AlliedVisionCamera:
         if not path.exists():
             raise FileNotFoundError(f"Settings file not found: {path}")
         self._cam.load_settings(str(path), PersistType.All)
-        _log.info("Camera settings loaded from %s", path)
+        _log.debug("Camera settings loaded from %s", path)
 
     # ------------------------------------------------------------------
     # Camera connection / disconnection callback
@@ -979,7 +989,7 @@ def live_view(cam: AlliedVisionCamera, window_title: str = "Live View") -> None:
             latest[0] = img.copy()
 
     cam.start_continuous(callback=_cb)
-    _log.info("Live view started. Press 'q' or <Esc> to quit.")
+    _log.debug("Live view started. Press 'q' or <Esc> to quit.")
 
     try:
         while True:
@@ -993,15 +1003,20 @@ def live_view(cam: AlliedVisionCamera, window_title: str = "Live View") -> None:
     finally:
         cam.stop_continuous()
         cv2.destroyWindow(window_title)
-        _log.info("Live view closed.")
+        _log.debug("Live view closed.")
 
 
 # ---------------------------------------------------------------------------
-# Demo / smoke-test  (run directly: python camera_interface.py)
+# Demo / smoke-test  (run directly: python allied_vision_camera.py)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
+
+    # The module itself stays silent by default (NullHandler). When run as a
+    # script, configure a simple console logger at WARNING so problems are
+    # visible without flooding the console with routine status messages.
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
     # Build a configuration – adjust values for your camera
     config = CameraConfig(
