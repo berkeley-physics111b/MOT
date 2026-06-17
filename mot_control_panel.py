@@ -2,6 +2,7 @@ import os
 import csv
 import time
 import ctypes
+import logging
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -13,6 +14,59 @@ from PIL import Image, ImageTk
 from waveforms_ads import WaveFormsADS
 from ttl_trigger import TTLTrigger, TTLTriggerConfig, TTLIdleState, TTLPolarity, TTLTriggerMode
 from allied_vision_camera import AlliedVisionCamera, CameraConfig, HardwareTriggerConfig, TriggerActivation, TriggerSelector, AcquisitionMode
+
+# The hardware wrapper modules (allied_vision_camera, ttl_trigger,
+# waveforms_ads) attach a NullHandler to their own loggers so they stay
+# silent when imported as libraries. Without a handler configured here,
+# real warnings/errors raised inside those modules (bad ROI, dropped
+# frames, GenICam feature failures, etc.) are logged and then simply
+# vanish with no console output -- which is exactly what made the
+# live-view bug below look like it was failing with "no errors".
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+
+def _normalize_camera_frame(frame):
+    """
+    VmbPy's Frame.as_numpy_ndarray() can return mono frames as a 3-D array
+    shaped (H, W, 1) rather than a true 2-D (H, W) array, depending on SDK
+    version / pixel format. Collapse that redundant trailing single-channel
+    dimension so every frame flowing through this application has one
+    predictable shape: 2-D for mono, 3-D (H, W, 3) for color. This keeps
+    shape-based checks (channel detection, background-subtraction shape
+    comparisons) correct regardless of which shape VmbPy happened to hand
+    back for a given frame.
+    """
+    if frame is None:
+        return None
+    if frame.ndim == 3 and frame.shape[2] == 1:
+        return frame[:, :, 0]
+    return frame
+
+
+def _frame_to_display_rgb(frame):
+    """
+    Convert a camera frame into an RGB array suitable for PIL/Tk display.
+
+    The previous logic picked BGR-vs-mono conversion using
+    `len(frame.shape) == 3`, which broke as soon as a mono frame arrived
+    shaped (H, W, 1): that's "3 dimensions" too, so it got routed into
+    COLOR_BGR2RGB and OpenCV raised an "invalid number of channels" error
+    on every single frame. This always normalizes first and dispatches on
+    the actual channel count instead of guessing from ndim alone.
+    """
+    frame = _normalize_camera_frame(frame)
+    if frame.ndim == 2:
+        return cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+    channels = frame.shape[2]
+    if channels == 3:
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if channels == 4:
+        return cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+    raise ValueError(f"Unsupported frame shape for display: {frame.shape}")
+
 
 class CoreInstrumentApplication(tk.Tk):
     def __init__(self):
@@ -31,7 +85,13 @@ class CoreInstrumentApplication(tk.Tk):
         self.latest_live_frame = None
         self.latest_pulsed_snapshot = None
         self.live_view_active = True
-        
+
+        # Persistent canvas image item id for the live view; reused via
+        # itemconfig() on every frame instead of stacking a fresh
+        # create_image() each time (which previously leaked one canvas
+        # item per frame and degraded performance over time).
+        self._live_canvas_image_id = None
+
         # Canvas Drag-to-ROI Coordinates
         self.drag_start_x = 0
         self.drag_start_y = 0
@@ -44,7 +104,7 @@ class CoreInstrumentApplication(tk.Tk):
         self.create_four_panels()
         
         # Start Live View Processing Loop
-        self.start_live_acquisition_thread()
+        self.start_live_view()
 
     def init_hardware_connections(self):
         """Secure safe handles to the hardware layers."""
@@ -52,7 +112,7 @@ class CoreInstrumentApplication(tk.Tk):
             self.ads = WaveFormsADS()
             self.ttl_trig = TTLTrigger(self.ads)
             # Initialize DIO 0,1,2 as outputs explicitly if required by platform
-            self.ads._dwf.FDwfDigitalIOOutputEnableSet(self.ads._hdwf, ctypes.c_int(0x07)) 
+            self.ads.digital_io_set_output_enable(0x07)
         except Exception as e:
             print(f"[Warning] Analog Discovery device could not connect: {e}")
             self.ads = None
@@ -195,7 +255,6 @@ class CoreInstrumentApplication(tk.Tk):
 
     def build_top_right_panel(self):
         """Live video viewport and camera configuration settings controls."""
-        # FIX: Removed the invalid padding option from the PanedWindow constructor
         main_layout = ttk.PanedWindow(self.p_top_right, orient="horizontal")
         main_layout.pack(fill="both", expand=True)
 
@@ -251,7 +310,7 @@ class CoreInstrumentApplication(tk.Tk):
         ttk.Button(action_box, text="Capture Snapshot Now", command=self.execute_immediate_snapshot).pack(fill="x", pady=2)
         ttk.Button(action_box, text="Extract & Save Background", command=self.capture_background_profile).pack(fill="x", pady=2)
         
-        self.btn_master_pulse = tk.Button(action_box, text="FIRE MASTER PULSE", bg="#d32f2f", fg="white", font=("Arial", 11, "bold"), command=self.execute_master_pulse_routine)
+        self.btn_master_pulse = tk.Button(action_box, text="Pulse", bg="#d32f2f", fg="white", font=("Arial", 11, "bold"), command=self.execute_master_pulse_routine)
         self.btn_master_pulse.pack(fill="x", pady=6)
 
         # Live Display Canvas Layout
@@ -317,7 +376,6 @@ class CoreInstrumentApplication(tk.Tk):
         viewport_frame = ttk.Frame(container)
         viewport_frame.pack(fill="both", expand=True, pady=4)
         
-        # FIX: Explicit grid weighting configurations ensure the left and right camera channels track equally
         viewport_frame.columnconfigure(0, weight=1)
         viewport_frame.columnconfigure(1, weight=1)
         viewport_frame.rowconfigure(0, weight=1)
@@ -362,6 +420,12 @@ class CoreInstrumentApplication(tk.Tk):
         self.roi_h.set(h)
 
         try:
+            # ROI changes are commonly rejected or silently ignored by
+            # GenICam cameras while continuous streaming is active (the
+            # underlying SDK even warns about this in set_roi()). Pause the
+            # live view, apply the change, then resume it.
+            self._stop_camera_live_view()
+
             # Reconfigure the internal hardware region definitions safely
             self.camera._config.roi_offset_x = x
             self.camera._config.roi_offset_y = y
@@ -374,6 +438,8 @@ class CoreInstrumentApplication(tk.Tk):
             print(f"[Camera] Bounded ROI applied successfully: {x}, {y}, {w}, {h}")
         except Exception as err:
             messagebox.showerror("ROI Limit Violation", f"The camera rejected these bounding coordinates: {err}")
+        finally:
+            self._start_camera_live_view()
 
     def apply_camera_attributes(self):
         """Commit electronic gain levels and timing windows directly onto camera registers."""
@@ -413,49 +479,103 @@ class CoreInstrumentApplication(tk.Tk):
     # LIVE VIEW STREAM PROCESSING LOOP
     # =========================================================================
 
-    def start_live_acquisition_thread(self):
-        """Asynchronously streams matrices from the camera to avoid blocking the main Tkinter thread loop."""
-        def capture_stream_worker():
-            while True:
-                if self.live_view_active and self.camera and self.camera._cam:
-                    try:
-                        # Capture a single frame using the software snapshot method
-                        frame = self.camera.take_snapshot()
-                        if frame is not None:
-                            self.latest_live_frame = frame.copy()
-                            self.process_and_update_live_canvas(frame)
-                    except Exception:
-                        pass
-                time.sleep(0.033) # Keep updates smooth around ~30 FPS
+    def start_live_view(self):
+        """
+        Start continuous (free-run) acquisition for the live display.
 
-        threading.Thread(target=capture_stream_worker, daemon=True).start()
+        The previous implementation polled `camera.take_snapshot()` at
+        ~30 Hz from a manual thread. take_snapshot() is the low-latency
+        *software-triggered single-shot* path: every call reconfigures
+        TriggerSource/TriggerSelector/TriggerMode/AcquisitionMode and runs a
+        full start_streaming()/stop_streaming() cycle -- far too much
+        per-frame GenICam overhead for live display, and prone to
+        intermittent failures under that load. AlliedVisionCamera already
+        exposes start_continuous()/stop_continuous() for exactly this case
+        (free-run, non-critical timing), so we use that and let VmbPy's own
+        streaming thread hand us frames via callback instead.
+        """
+        self._start_camera_live_view()
 
-    def process_and_update_live_canvas(self, raw_img_matrix):
-        """Applies mathematical subtraction steps live before drawing raw frames onto the canvas."""
-        processed_frame = raw_img_matrix.copy()
-        
-        # Execute real-time background absolute value frame subtraction if valid matrices exist
+    def _start_camera_live_view(self):
+        """Arm continuous (free-run) streaming and register the frame callback."""
+        if not (self.camera and self.camera._cam):
+            return
+        try:
+            self.camera.start_continuous(callback=self._on_live_frame)
+        except Exception as e:
+            print(f"[Live View] Could not start continuous streaming: {e}")
+
+    def _stop_camera_live_view(self):
+        """Stop continuous streaming. Required before any software/hardware trigger use."""
+        if not (self.camera and self.camera._cam):
+            return
+        try:
+            self.camera.stop_continuous()
+        except Exception as e:
+            print(f"[Live View] Could not stop continuous streaming: {e}")
+
+    def _on_live_frame(self, raw_frame, timestamp_s):
+        """
+        Frame callback invoked by VmbPy's internal streaming thread -- this
+        is NOT the Tkinter main thread. Tk/Tcl is not thread-safe, so no Tk
+        widget calls (winfo_*, Canvas/PhotoImage creation, etc.) may happen
+        here. Do the lightweight numpy bookkeeping on this thread, then hand
+        off to the main thread via after() for anything GUI-related.
+        """
+        if not self.live_view_active:
+            return
+        try:
+            frame = _normalize_camera_frame(raw_frame)
+            self.latest_live_frame = frame.copy()
+            self.after(0, self._update_live_canvas, frame)
+        except Exception as e:
+            # The old polling loop wrapped this whole path in a bare
+            # `except Exception: pass`, so failures like this (e.g. the
+            # channel-shape bug below) fired on every frame and never
+            # produced a single line of console output.
+            print(f"[Live View] Frame processing error: {e}")
+
+    def _update_live_canvas(self, raw_frame):
+        """
+        Main-thread-only: apply background subtraction, convert to RGB,
+        scale to the canvas size, and paint it. All Tk widget calls live
+        here, since this only ever runs via self.after() on the main loop.
+        """
+        if not self.live_view_active:
+            return
+
+        processed_frame = raw_frame
         if self.background_image is not None and self.background_image.shape == processed_frame.shape:
             processed_frame = cv2.absdiff(processed_frame, self.background_image)
 
-        # Scale down large raw array arrays to fit display panels safely
         canvas_w = self.camera_canvas.winfo_width()
         canvas_h = self.camera_canvas.winfo_height()
         if canvas_w < 10 or canvas_h < 10:
             canvas_w, canvas_h = 640, 480
 
-        img_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB) if len(processed_frame.shape) == 3 else cv2.cvtColor(processed_frame, cv2.COLOR_GRAY2RGB)
-        pil_img = Image.fromarray(img_rgb)
-        pil_img = pil_img.resize((canvas_w, canvas_h), Image.Resampling.LANCZOS)
-        
+        try:
+            img_rgb = _frame_to_display_rgb(processed_frame)
+        except Exception as e:
+            print(f"[Live View] Could not convert frame for display: {e}")
+            return
+
+        pil_img = Image.fromarray(img_rgb).resize((canvas_w, canvas_h), Image.Resampling.LANCZOS)
         tk_img = ImageTk.PhotoImage(image=pil_img)
-        
-        # Thread-safe interface injection back onto the Tkinter canvas pipeline
-        self.after(0, self._render_tk_image_to_canvas, tk_img)
+        self._render_tk_image_to_canvas(tk_img)
 
     def _render_tk_image_to_canvas(self, tk_img):
-        self._live_tk_image_holder = tk_img # Maintain pointer memory reference to prevent sudden garbage collection drops
-        self.camera_canvas.create_image(0, 0, anchor="nw", image=tk_img)
+        self._live_tk_image_holder = tk_img  # Maintain pointer memory reference to prevent sudden garbage collection drops
+
+        # Reuse a single canvas image item via itemconfig() instead of
+        # calling create_image() on every frame. The original version
+        # created a brand-new image item ~30 times/second without ever
+        # deleting the previous one, silently accumulating thousands of
+        # canvas items per session until the UI bogged down.
+        if self._live_canvas_image_id is None:
+            self._live_canvas_image_id = self.camera_canvas.create_image(0, 0, anchor="nw", image=tk_img)
+        else:
+            self.camera_canvas.itemconfig(self._live_canvas_image_id, image=tk_img)
+
         # Keep bounding box overlay visible on top of the image stream
         if self.current_rect_id:
             self.camera_canvas.tag_raise(self.current_rect_id)
@@ -550,22 +670,28 @@ class CoreInstrumentApplication(tk.Tk):
             processed = self.latest_pulsed_snapshot.copy()
             if self.background_image is not None and self.background_image.shape == processed.shape:
                 processed = cv2.absdiff(processed, self.background_image)
-                
-            img_rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB) if len(processed.shape) == 3 else cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB)
-            pil_img = Image.fromarray(img_rgb).resize((w, h), Image.Resampling.LANCZOS)
-            tk_img = ImageTk.PhotoImage(image=pil_img)
-            self._snap_tk_holder = tk_img
-            self.lbl_snapshot_display.config(image=tk_img)
+
+            try:
+                img_rgb = _frame_to_display_rgb(processed)
+                pil_img = Image.fromarray(img_rgb).resize((w, h), Image.Resampling.LANCZOS)
+                tk_img = ImageTk.PhotoImage(image=pil_img)
+                self._snap_tk_holder = tk_img
+                self.lbl_snapshot_display.config(image=tk_img)
+            except Exception as e:
+                print(f"[Snapshot Viewport] Could not display pulsed snapshot: {e}")
         else:
             self.lbl_snapshot_display.config(image="", text="No Snapshot Triggered Yet")
 
         # Render Right Profile (Active Background Matrix Reference)
         if self.background_image is not None:
-            img_rgb = cv2.cvtColor(self.background_image, cv2.COLOR_BGR2RGB) if len(self.background_image.shape) == 3 else cv2.cvtColor(self.background_image, cv2.COLOR_GRAY2RGB)
-            pil_img = Image.fromarray(img_rgb).resize((w, h), Image.Resampling.LANCZOS)
-            tk_img = ImageTk.PhotoImage(image=pil_img)
-            self._bg_tk_holder = tk_img
-            self.lbl_background_display.config(image=tk_img)
+            try:
+                img_rgb = _frame_to_display_rgb(self.background_image)
+                pil_img = Image.fromarray(img_rgb).resize((w, h), Image.Resampling.LANCZOS)
+                tk_img = ImageTk.PhotoImage(image=pil_img)
+                self._bg_tk_holder = tk_img
+                self.lbl_background_display.config(image=tk_img)
+            except Exception as e:
+                print(f"[Snapshot Viewport] Could not display background frame: {e}")
         else:
             self.lbl_background_display.config(image="", text="Empty Background Frame Vector Buffer")
 
@@ -575,6 +701,8 @@ class CoreInstrumentApplication(tk.Tk):
             if path:
                 cv2.imwrite(path, self.latest_pulsed_snapshot)
                 print(f"[Storage Matrix] Manually written frame exported out to: {path}")
+        else:
+            print(f"[Storage Matrix] No pulsed snapshot to save")
 
     # =========================================================================
     # THE MASTER SYNCHRONIZED TIMING PULSE SEQUENCE ENGINE
@@ -585,6 +713,11 @@ class CoreInstrumentApplication(tk.Tk):
         # Visual indicators locking downstream operations
         self.btn_master_pulse.config(text="RUNNING SEQUENCE...", state="disabled")
         self.live_view_active = False # Pause top-right continuous loop tracking
+
+        # take_snapshot()/arm_hardware_trigger() both raise if continuous
+        # streaming is still active, so stop it here on the main thread
+        # before the worker thread below starts touching the camera.
+        self._stop_camera_live_view()
 
         def sequence_execution_worker():
             try:
@@ -694,6 +827,7 @@ class CoreInstrumentApplication(tk.Tk):
     def finalize_and_render_pulse_metrics(self, captured_frame, scope_voltages, total_duration_s):
         """Brings the user interface out of freeze lock, saving array inputs out to stable disks."""
         if captured_frame is not None:
+            captured_frame = _normalize_camera_frame(captured_frame)
             self.latest_pulsed_snapshot = captured_frame.copy()
             self.refresh_data_snapshot_viewports()
             
@@ -760,6 +894,7 @@ class CoreInstrumentApplication(tk.Tk):
         """Re-enables the GUI inputs and resumes the live video processing loop safely."""
         self.btn_master_pulse.config(text="FIRE MASTER PULSE", state="normal")
         self.live_view_active = True
+        self._start_camera_live_view()
 
 if __name__ == "__main__":
     app = CoreInstrumentApplication()
