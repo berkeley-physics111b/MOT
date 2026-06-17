@@ -506,7 +506,7 @@ class CoreInstrumentApplication(tk.Tk):
             return
         # Ensure pattern generator channels are fully closed to avoid system state locking
         try:
-            self.ads._dwf.FDwfDigitalOutReset(self.ads._hdwf)
+            self.ads.digital_io_reset()
         except Exception:
             pass
             
@@ -793,9 +793,9 @@ class CoreInstrumentApplication(tk.Tk):
                     
                     # Set up hardware triggering off the synchronized digital bus line
                     # trigsrcDigitalIn (3 or 5) gates the buffer storage sweep seamlessly
-                    self.ads._dwf.FDwfAnalogInTriggerSourceSet(self.ads._hdwf, ctypes.c_byte(3)) 
-                    self.ads._dwf.FDwfAnalogInTriggerTypeSet(self.ads._hdwf, ctypes.c_int(0)) # Edge triggering
-                    self.ads._dwf.FDwfAnalogInTriggerConditionSet(self.ads._hdwf, ctypes.c_int(0)) # Rising edge trigger
+                    self.ads.analog_in_set_trigger_source(3)
+                    self.ads.analog_in_set_trigger_type(0) # Edge triggering
+                    self.ads.analog_in_set_trigger_condition(0) # Rising edge
                     
                     # Arm the oscilloscope engine to wait for the upcoming digital pulse
                     self.ads.analog_in_configure(reconfigure=True, start=True)
