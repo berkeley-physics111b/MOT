@@ -118,11 +118,32 @@ class CoreInstrumentApplication(tk.Tk):
             self.ads = None
             self.ttl_trig = None
 
+        # Discovered hardware-trigger vocabulary for the connected camera.
+        # Different Allied Vision models expose different GPIO line names
+        # and trigger selector entries -- "Line1" / "FrameStart" are common
+        # but NOT universal, and feeding an unsupported name to the camera
+        # raises a GenICam "no enum entry" error. Query what this specific
+        # camera actually supports instead of hardcoding a guess.
+        self.available_trigger_lines = []
+        self.available_trigger_selectors = []
+
         try:
             # Generate baseline configuration for Allied Vision
             cam_cfg = CameraConfig(exposure_time_us=20000, gain=0.0, brightness=0.0)
             self.camera = AlliedVisionCamera(cam_cfg)
             self.camera.open()
+
+            try:
+                self.available_trigger_lines = list(self.camera.list_hardware_trigger_lines())
+                print(f"[Camera] GPIO trigger lines reported by this camera: {self.available_trigger_lines}")
+            except Exception as e:
+                print(f"[Camera] Could not enumerate GPIO trigger lines: {e}")
+
+            try:
+                self.available_trigger_selectors = [str(entry) for entry in self.camera._cam.TriggerSelector.get_all_entries()]
+                print(f"[Camera] Trigger selectors reported by this camera: {self.available_trigger_selectors}")
+            except Exception as e:
+                print(f"[Camera] Could not enumerate trigger selectors: {e}")
         except Exception as e:
             print(f"[Warning] Allied Vision Camera could not connect: {e}")
             self.camera = None
@@ -302,6 +323,32 @@ class CoreInstrumentApplication(tk.Tk):
         ttk.Entry(param_box, textvariable=self.var_brightness, width=8).grid(row=2, column=1)
         
         ttk.Button(param_box, text="Commit Attributes", command=self.apply_camera_attributes).grid(row=3, column=0, columnspan=2, pady=4)
+
+        # Hardware Trigger Wiring -- populated from whatever GPIO lines and
+        # trigger selectors THIS connected camera actually reports
+        # (queried in init_hardware_connections). Different camera models
+        # use different names here ("Line1" / "FrameStart" are common
+        # defaults but not universal), so hardcoding them caused
+        # "no enum entry" errors on cameras that don't expose those exact
+        # names. Falling back to a placeholder list keeps the GUI usable
+        # even if no camera is connected yet.
+        line_options = self.available_trigger_lines or ["Line1"]
+        selector_options = self.available_trigger_selectors or ["FrameStart"]
+
+        self.var_trigger_line = tk.StringVar(value=line_options[0])
+        self.var_trigger_selector = tk.StringVar(value=selector_options[0])
+
+        trig_box = ttk.LabelFrame(controls_frame, text="Hardware Trigger Wiring")
+        trig_box.pack(fill="x", pady=4, padx=2)
+
+        ttk.Label(trig_box, text="GPIO Line:").grid(row=0, column=0, **grid_params)
+        ttk.Combobox(trig_box, textvariable=self.var_trigger_line, values=line_options, width=14, state="readonly").grid(row=0, column=1, sticky="w")
+
+        ttk.Label(trig_box, text="Trigger Selector:").grid(row=1, column=0, **grid_params)
+        ttk.Combobox(trig_box, textvariable=self.var_trigger_selector, values=selector_options, width=14, state="readonly").grid(row=1, column=1, sticky="w")
+
+        if not self.available_trigger_lines or not self.available_trigger_selectors:
+            ttk.Label(trig_box, text="(No camera connected -- placeholder values shown)", foreground="#cc8800").grid(row=2, column=0, columnspan=2, sticky="w", padx=2)
 
         # Operational Control Buttons Pack
         action_box = ttk.LabelFrame(controls_frame, text="Direct Trigger Operations")
@@ -755,15 +802,41 @@ class CoreInstrumentApplication(tk.Tk):
 
                 # 3. Arm and prepare the Camera for the incoming hardware TTL trigger edge
                 if self.camera and self.camera._cam:
-                    # Configure camera to listen on Line 1 for a rising edge trigger
+                    # Use whatever GPIO line / trigger selector the user has
+                    # picked in the "Hardware Trigger Wiring" dropdowns,
+                    # which are populated from this specific camera's
+                    # actual reported entries -- not a hardcoded "Line1" /
+                    # "FrameStart" guess that may not exist on this model.
+                    trigger_line = self.var_trigger_line.get()
+                    trigger_selector_str = self.var_trigger_selector.get()
+                    try:
+                        trigger_selector = TriggerSelector(trigger_selector_str)
+                    except ValueError:
+                        # This camera reports a selector name our enum
+                        # wrapper doesn't know about. FrameStart is the one
+                        # virtually every trigger-capable GenICam camera
+                        # supports, so fall back to it rather than failing
+                        # outright.
+                        print(f"[Pulse Engine] Unrecognized trigger selector '{trigger_selector_str}'; defaulting to FrameStart.")
+                        trigger_selector = TriggerSelector.FRAME_START
+
                     hw_trigger_config = HardwareTriggerConfig(
-                        line="Line1",
+                        line=trigger_line,
                         activation=TriggerActivation.RISING_EDGE,
-                        selector=TriggerSelector.FRAME_START,
+                        selector=trigger_selector,
                         acquisition_mode=AcquisitionMode.SINGLE_FRAME,
                         timeout_s=5.0
                     )
-                    self.camera.arm_hardware_trigger(hw_trigger_config)
+                    try:
+                        self.camera.arm_hardware_trigger(hw_trigger_config)
+                    except Exception as arm_err:
+                        raise RuntimeError(
+                            f"Could not arm camera hardware trigger with line='{trigger_line}', "
+                            f"selector='{trigger_selector_str}': {arm_err}. This camera reports "
+                            f"available lines={self.available_trigger_lines or 'unknown'} and "
+                            f"trigger selectors={self.available_trigger_selectors or 'unknown'} -- "
+                            f"pick matching values in the Hardware Trigger Wiring panel."
+                        ) from arm_err
 
                 # 4. Configure the hardware pattern generator lines via the custom controller
                 if self.ttl_trig:
