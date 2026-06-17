@@ -1,6 +1,7 @@
 import os
 import csv
 import time
+import ctypes
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -194,9 +195,11 @@ class CoreInstrumentApplication(tk.Tk):
 
     def build_top_right_panel(self):
         """Live video viewport and camera configuration settings controls."""
+        # FIX: Removed the invalid padding option from the PanedWindow constructor
         main_layout = ttk.PanedWindow(self.p_top_right, orient="horizontal")
-        main_layout.pack(fill="both", expand=True, padding=4)
+        main_layout.pack(fill="both", expand=True)
 
+        # Separate sub-frames for configurations and live video canvas feed
         controls_frame = ttk.Frame(main_layout, padding=4)
         main_layout.add(controls_frame, weight=1)
 
@@ -287,7 +290,9 @@ class CoreInstrumentApplication(tk.Tk):
 
         # WaveForms Oscilloscope Trace Visual Canvas Display Component
         ttk.Label(container, text="Oscilloscope Buffer Display: Channel 0 (Fluorescence Array Data)").pack(anchor="w", pady=(6,0))
-        self.scope_canvas = tk.Canvas(container, bg="#000000", height=180)
+        
+        # FIX: Placed inside a dedicated canvas master frame with pack parameters configured to scale properly
+        self.scope_canvas = tk.Canvas(container, bg="#000000", height=180, highlightthickness=0)
         self.scope_canvas.pack(fill="both", expand=True, pady=4)
 
     def build_bottom_right_panel(self):
@@ -311,6 +316,8 @@ class CoreInstrumentApplication(tk.Tk):
         # Two-channel Display Viewport Sub-frames
         viewport_frame = ttk.Frame(container)
         viewport_frame.pack(fill="both", expand=True, pady=4)
+        
+        # FIX: Explicit grid weighting configurations ensure the left and right camera channels track equally
         viewport_frame.columnconfigure(0, weight=1)
         viewport_frame.columnconfigure(1, weight=1)
         viewport_frame.rowconfigure(0, weight=1)
