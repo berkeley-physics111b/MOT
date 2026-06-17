@@ -16,8 +16,8 @@ from allied_vision_camera import AlliedVisionCamera, CameraConfig, HardwareTrigg
 class CoreInstrumentApplication(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Instrument Control Platform (4-Panel Architecture)")
-        self.geometry("1400 leaping_bounds")
+        self.title("MOT Control Panel")
+        self.geometry("1400x900")
         self.state("zoomed") # Open maximized for visual real estate
 
         # Initialize Hardware Interface Objects
