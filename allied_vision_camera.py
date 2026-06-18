@@ -566,16 +566,21 @@ class AlliedVisionCamera:
     # Software-triggered snapshot  (timing-critical)
     # ------------------------------------------------------------------
 
-    def take_snapshot(self) -> np.ndarray:
+    def take_snapshot(self, wait_time=0.0) -> np.ndarray:
         """
         Arm the camera for a single software-triggered acquisition, fire the
-        trigger immediately, wait for the frame, and return it as an ndarray.
+        trigger at a time set by wait_time, wait for the frame, and return it as an ndarray.
 
         This path is optimised for minimal latency between the trigger command
         and the start of exposure.  The camera is placed in SingleFrame /
         Software-trigger mode, the streaming pipeline is pre-started (so
         buffers are already queued in the driver), and only then is the trigger
         command issued.
+
+        Parameters
+        -------
+        wait_time (float, default 0.0): 
+            Time to sleep before triggering. Passes into time.sleep call.
 
         Returns
         -------
@@ -613,6 +618,7 @@ class AlliedVisionCamera:
             # -------------------------------------------------------
             # FIRE TRIGGER  ← minimise code between here and .run()
             # -------------------------------------------------------
+            time.sleep(wait_time)
             cam.TriggerSoftware.run()
             # -------------------------------------------------------
 

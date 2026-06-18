@@ -807,6 +807,9 @@ class CoreInstrumentApplication(tk.Tk):
                     # which are populated from this specific camera's
                     # actual reported entries -- not a hardcoded "Line1" /
                     # "FrameStart" guess that may not exist on this model.
+                    
+                    print("[Pulse Engine Camera] Using software trigger instead of hardware trigger for now...")
+                    """
                     trigger_line = self.var_trigger_line.get()
                     trigger_selector_str = self.var_trigger_selector.get()
                     try:
@@ -837,6 +840,7 @@ class CoreInstrumentApplication(tk.Tk):
                             f"trigger selectors={self.available_trigger_selectors or 'unknown'} -- "
                             f"pick matching values in the Hardware Trigger Wiring panel."
                         ) from arm_err
+                    """
 
                 # 4. Configure the hardware pattern generator lines via the custom controller
                 if self.ttl_trig:
@@ -868,11 +872,14 @@ class CoreInstrumentApplication(tk.Tk):
                 captured_frame = None
                 if self.camera and self.camera._cam:
                     try:
-                        captured_frame = self.camera.wait_for_hardware_trigger(timeout_s=5.0)
+                        #captured_frame = self.camera.wait_for_hardware_trigger(timeout_s=5.0)
+                        # temporarily using software trigger
+                        captured_frame = self.camera.take_snapshot()
                     except Exception as err:
                         print(f"[Pulse Engine Camera Exception] Match trace drop: {err}")
                     finally:
-                        self.camera.disarm_hardware_trigger()
+                        #self.camera.disarm_hardware_trigger()
+                        pass
 
                 # Poll and grab the oscilloscope data arrays
                 scope_voltages = np.array([])
