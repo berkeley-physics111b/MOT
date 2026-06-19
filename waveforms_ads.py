@@ -125,6 +125,24 @@ AUTOCFG_DISABLE  = 0
 AUTOCFG_ENABLE   = 1
 AUTOCFG_DYNAMIC  = 3
 
+# Digital Out output modes (DwfDigitalOutOutput)
+DwfDigitalOutOutputPushPull   = 0  # Default; drives both high and low
+DwfDigitalOutOutputOpenDrain  = 1  # Open-drain; requires external pull-up
+DwfDigitalOutOutputOpenSource = 2  # Open-source; requires external pull-down
+DwfDigitalOutOutputThreeState = 3  # Hi-Z; available with custom/random types
+
+# Digital Out channel types (DwfDigitalOutType)
+DwfDigitalOutTypePulse  = 0  # Frequency = clk / divider / (low_cnt + high_cnt)
+DwfDigitalOutTypeCustom = 1  # Custom pattern; sample rate = clk / divider
+DwfDigitalOutTypeRandom = 2  # Random; update rate = clk / divider / counter
+DwfDigitalOutTypeROM    = 3  # ROM logic; DIO input is address, output is value
+
+# Digital Out idle states (DwfDigitalOutIdle)
+DwfDigitalOutIdleInit = 0  # Output the initial (counter-init) level when idle
+DwfDigitalOutIdleLow  = 1  # Drive low when idle
+DwfDigitalOutIdleHigh = 2  # Drive high when idle
+DwfDigitalOutIdleZet  = 3  # Three-state (hi-Z) when idle
+
 
 # ---------------------------------------------------------------------------
 # Library loader
@@ -1208,6 +1226,691 @@ class WaveFormsADS:
         else:
             new_mask = cur.value & ~(1 << pin)
         self.digital_io_set_output(new_mask)
+
+    # ------------------------------------------------------------------
+    # Digital Out – Pattern Generator
+    # ------------------------------------------------------------------
+    #
+    # The DigitalOut instrument drives the same physical pins as Digital I/O
+    # but uses a dedicated clocked engine capable of precise pulse/pattern
+    # generation.  Pin indices are the same 0-based channel indices used by
+    # the rest of the digital I/O subsystem.
+    #
+    # State machine (per FDwfDigitalOutConfigure):
+    #   Ready → Armed → [Wait] → Running → [Repeat] → Done
+    #
+    # Pulse mode mechanics (DwfDigitalOutTypePulse):
+    #   Output frequency = internal_clock / divider / (low_count + high_count)
+    #   FDwfDigitalOutCounterInitSet sets the *initial* level and tick-count
+    #   (i.e. the delay before the first transition), while
+    #   FDwfDigitalOutCounterSet sets the steady-state low/high tick-counts.
+    # ------------------------------------------------------------------
+
+    # --- Control -------------------------------------------------------
+
+    def digital_out_reset(self) -> None:
+        """Reset all Digital Out channels and parameters to defaults."""
+        self._check(
+            self._dwf.FDwfDigitalOutReset(self._hdwf),
+            "FDwfDigitalOutReset",
+        )
+
+    def digital_out_configure(self, start: bool = True) -> None:
+        """Start (``start=True``) or stop (``start=False``) the pattern generator."""
+        self._check(
+            self._dwf.FDwfDigitalOutConfigure(self._hdwf, int(start)),
+            "FDwfDigitalOutConfigure",
+        )
+
+    def digital_out_status(self) -> int:
+        """Poll the pattern generator state.  Returns a DwfState integer."""
+        sts = ctypes.c_byte(0)
+        self._check(
+            self._dwf.FDwfDigitalOutStatus(self._hdwf, ctypes.byref(sts)),
+            "FDwfDigitalOutStatus",
+        )
+        return int(sts.value)
+
+    # --- Global timing -------------------------------------------------
+
+    def digital_out_get_internal_clock(self) -> float:
+        """Return the internal pattern-generator clock frequency in Hz."""
+        hz = ctypes.c_double(0.0)
+        self._check(
+            self._dwf.FDwfDigitalOutInternalClockInfo(self._hdwf, ctypes.byref(hz)),
+            "FDwfDigitalOutInternalClockInfo",
+        )
+        return hz.value
+
+    def digital_out_set_trigger_source(self, source: int = trigsrcNone) -> None:
+        """Set the pattern-generator trigger source (default: trigsrcNone = immediate)."""
+        self._check(
+            self._dwf.FDwfDigitalOutTriggerSourceSet(self._hdwf, source),
+            "FDwfDigitalOutTriggerSourceSet",
+        )
+
+    def digital_out_get_trigger_source(self) -> int:
+        """Return the configured pattern-generator trigger source."""
+        src = ctypes.c_int(0)
+        self._check(
+            self._dwf.FDwfDigitalOutTriggerSourceGet(self._hdwf, ctypes.byref(src)),
+            "FDwfDigitalOutTriggerSourceGet",
+        )
+        return src.value
+
+    def digital_out_set_trigger_slope(self, slope: int = DwfTriggerSlopeRise) -> None:
+        """Set the trigger edge slope for the pattern generator."""
+        self._check(
+            self._dwf.FDwfDigitalOutTriggerSlopeSet(self._hdwf, slope),
+            "FDwfDigitalOutTriggerSlopeSet",
+        )
+
+    def digital_out_set_run_time(self, seconds: float) -> None:
+        """
+        Set total pattern run duration in seconds.
+        0 = run indefinitely (until stopped explicitly).
+        """
+        self._check(
+            self._dwf.FDwfDigitalOutRunSet(self._hdwf, ctypes.c_double(seconds)),
+            "FDwfDigitalOutRunSet",
+        )
+
+    def digital_out_get_run_time(self) -> float:
+        """Return the configured pattern run duration in seconds."""
+        v = ctypes.c_double(0.0)
+        self._check(
+            self._dwf.FDwfDigitalOutRunGet(self._hdwf, ctypes.byref(v)),
+            "FDwfDigitalOutRunGet",
+        )
+        return v.value
+
+    def digital_out_set_wait_time(self, seconds: float) -> None:
+        """
+        Set the delay between trigger and first output edge in seconds.
+        0 = no wait (default).
+        """
+        self._check(
+            self._dwf.FDwfDigitalOutWaitSet(self._hdwf, ctypes.c_double(seconds)),
+            "FDwfDigitalOutWaitSet",
+        )
+
+    def digital_out_get_wait_time(self) -> float:
+        """Return the configured wait (pre-output delay) duration in seconds."""
+        v = ctypes.c_double(0.0)
+        self._check(
+            self._dwf.FDwfDigitalOutWaitGet(self._hdwf, ctypes.byref(v)),
+            "FDwfDigitalOutWaitGet",
+        )
+        return v.value
+
+    def digital_out_set_repeat(self, count: int) -> None:
+        """
+        Set the number of times the full run is repeated.
+        0 = repeat indefinitely.  1 = run once (default).
+        """
+        self._check(
+            self._dwf.FDwfDigitalOutRepeatSet(self._hdwf, count),
+            "FDwfDigitalOutRepeatSet",
+        )
+
+    def digital_out_get_repeat(self) -> int:
+        """Return the configured repeat count."""
+        v = ctypes.c_uint(0)
+        self._check(
+            self._dwf.FDwfDigitalOutRepeatGet(self._hdwf, ctypes.byref(v)),
+            "FDwfDigitalOutRepeatGet",
+        )
+        return v.value
+
+    def digital_out_set_repeat_trigger(self, enable: bool) -> None:
+        """
+        When True, each repeat cycle waits for a new trigger before re-running.
+        When False (default), repeats run back-to-back without re-triggering.
+        """
+        self._check(
+            self._dwf.FDwfDigitalOutRepeatTriggerSet(self._hdwf, int(enable)),
+            "FDwfDigitalOutRepeatTriggerSet",
+        )
+
+    # --- Channel count -------------------------------------------------
+
+    def digital_out_channel_count(self) -> int:
+        """Return the number of Digital Out channels available on this device."""
+        n = ctypes.c_int(0)
+        self._check(
+            self._dwf.FDwfDigitalOutCount(self._hdwf, ctypes.byref(n)),
+            "FDwfDigitalOutCount",
+        )
+        return n.value
+
+    # --- Per-channel settings ------------------------------------------
+
+    def digital_out_enable_channel(self, channel: int, enable: bool = True) -> None:
+        """Enable or disable a single Digital Out channel (pin)."""
+        self._check(
+            self._dwf.FDwfDigitalOutEnableSet(self._hdwf, channel, int(enable)),
+            "FDwfDigitalOutEnableSet",
+        )
+
+    def digital_out_set_output_mode(
+        self, channel: int, mode: int = DwfDigitalOutOutputPushPull
+    ) -> None:
+        """
+        Set the electrical output mode for a channel.
+
+        Parameters
+        ----------
+        channel : int
+            0-based channel / pin index.
+        mode : int
+            DwfDigitalOutOutputPushPull (default), DwfDigitalOutOutputOpenDrain,
+            DwfDigitalOutOutputOpenSource, or DwfDigitalOutOutputThreeState.
+        """
+        self._check(
+            self._dwf.FDwfDigitalOutOutputSet(self._hdwf, channel, mode),
+            "FDwfDigitalOutOutputSet",
+        )
+
+    def digital_out_set_type(
+        self, channel: int, out_type: int = DwfDigitalOutTypePulse
+    ) -> None:
+        """
+        Set the signal type for a channel.
+
+        Parameters
+        ----------
+        channel : int
+            0-based channel / pin index.
+        out_type : int
+            DwfDigitalOutTypePulse  – hardware counter-based pulse (most precise),
+            DwfDigitalOutTypeCustom – arbitrary bit-pattern from a buffer,
+            DwfDigitalOutTypeRandom – pseudo-random bit stream,
+            DwfDigitalOutTypeROM    – DIO input pins address a lookup table.
+        """
+        self._check(
+            self._dwf.FDwfDigitalOutTypeSet(self._hdwf, channel, out_type),
+            "FDwfDigitalOutTypeSet",
+        )
+
+    def digital_out_set_idle(
+        self, channel: int, idle: int = DwfDigitalOutIdleLow
+    ) -> None:
+        """
+        Set the output level of a channel while the instrument is not running.
+
+        Parameters
+        ----------
+        channel : int
+            0-based channel / pin index.
+        idle : int
+            DwfDigitalOutIdleLow  – drive low,
+            DwfDigitalOutIdleHigh – drive high,
+            DwfDigitalOutIdleInit – use the counter-init level,
+            DwfDigitalOutIdleZet  – hi-Z / three-state.
+        """
+        self._check(
+            self._dwf.FDwfDigitalOutIdleSet(self._hdwf, channel, idle),
+            "FDwfDigitalOutIdleSet",
+        )
+
+    # --- Divider (clock prescaler per channel) -------------------------
+
+    def digital_out_set_divider_init(self, channel: int, value: int) -> None:
+        """
+        Set the *initial* clock divider count for ``channel``.
+
+        This controls how many internal clock ticks occur before the very first
+        counter decrement after entering Running state — effectively a sub-tick
+        start delay.  Most applications can leave this equal to
+        ``digital_out_set_divider``.
+
+        Parameters
+        ----------
+        channel : int
+            0-based channel / pin index.
+        value : int
+            Initial divider load value (≥ 1).
+        """
+        self._check(
+            self._dwf.FDwfDigitalOutDividerInitSet(self._hdwf, channel, value),
+            "FDwfDigitalOutDividerInitSet",
+        )
+
+    def digital_out_set_divider(self, channel: int, value: int) -> None:
+        """
+        Set the steady-state clock divider for ``channel``.
+
+        The pattern-generator clock tick rate seen by the counter is:
+        ``tick_rate = internal_clock / value``
+
+        Parameters
+        ----------
+        channel : int
+            0-based channel / pin index.
+        value : int
+            Divider value (≥ 1).  1 = no division (maximum speed).
+        """
+        self._check(
+            self._dwf.FDwfDigitalOutDividerSet(self._hdwf, channel, value),
+            "FDwfDigitalOutDividerSet",
+        )
+
+    def digital_out_get_divider(self, channel: int) -> int:
+        """Return the configured steady-state divider value for ``channel``."""
+        v = ctypes.c_uint(0)
+        self._check(
+            self._dwf.FDwfDigitalOutDividerGet(self._hdwf, channel, ctypes.byref(v)),
+            "FDwfDigitalOutDividerGet",
+        )
+        return v.value
+
+    # --- Counter (pulse timing per channel) ----------------------------
+
+    def digital_out_set_counter_init(
+        self, channel: int, start_high: bool, initial_count: int
+    ) -> None:
+        """
+        Set the initial output level and tick-count for ``channel``.
+
+        In pulse mode the *initial* counter determines the first half-period
+        before the first transition.  Setting ``initial_count`` equal to the
+        steady-state high or low count (depending on ``start_high``) produces a
+        clean, delay-free pulse train from the very first edge.
+
+        Parameters
+        ----------
+        channel : int
+            0-based channel / pin index.
+        start_high : bool
+            True  → pin starts HIGH then goes low after ``initial_count`` ticks,
+            False → pin starts LOW then goes high after ``initial_count`` ticks.
+        initial_count : int
+            Number of divider-ticks the initial level is held (≥ 1).
+        """
+        self._check(
+            self._dwf.FDwfDigitalOutCounterInitSet(
+                self._hdwf, channel, int(start_high), initial_count
+            ),
+            "FDwfDigitalOutCounterInitSet",
+        )
+
+    def digital_out_set_counter(
+        self, channel: int, low_count: int, high_count: int
+    ) -> None:
+        """
+        Set the steady-state low and high tick-counts for pulse-mode ``channel``.
+
+        The resulting pulse frequency is:
+        ``freq = internal_clock / divider / (low_count + high_count)``
+
+        And the duty cycle is:
+        ``duty = high_count / (low_count + high_count)``
+
+        Parameters
+        ----------
+        channel : int
+            0-based channel / pin index.
+        low_count : int
+            Number of divider-ticks the pin is driven LOW per period.
+        high_count : int
+            Number of divider-ticks the pin is driven HIGH per period.
+        """
+        self._check(
+            self._dwf.FDwfDigitalOutCounterSet(
+                self._hdwf, channel, low_count, high_count
+            ),
+            "FDwfDigitalOutCounterSet",
+        )
+
+    def digital_out_get_counter(self, channel: int) -> Tuple[int, int]:
+        """Return ``(low_count, high_count)`` for the specified ``channel``."""
+        lo = ctypes.c_uint(0)
+        hi = ctypes.c_uint(0)
+        self._check(
+            self._dwf.FDwfDigitalOutCounterGet(
+                self._hdwf, channel, ctypes.byref(lo), ctypes.byref(hi)
+            ),
+            "FDwfDigitalOutCounterGet",
+        )
+        return lo.value, hi.value
+
+    def digital_out_set_repetition(self, channel: int, count: int) -> None:
+        """
+        Set the per-channel counter repetition count (ADP3X50 and newer).
+
+        For pulse-mode channels, set this to ``2 * desired_pulse_count`` because
+        each pulse consumes two counter loads (one low, one high).  0 = infinite.
+
+        Parameters
+        ----------
+        channel : int
+            0-based channel / pin index.
+        count : int
+            Repetition value.  For N pulses use ``2 * N``.  0 = continuous.
+        """
+        self._check(
+            self._dwf.FDwfDigitalOutRepetitionSet(self._hdwf, channel, count),
+            "FDwfDigitalOutRepetitionSet",
+        )
+
+    # --- Custom pattern data -------------------------------------------
+
+    def digital_out_set_custom_data(
+        self, channel: int, bits: "np.ndarray | List[int]"
+    ) -> None:
+        """
+        Upload a custom bit pattern for ``channel`` (DwfDigitalOutTypeCustom).
+
+        Bits are sent out LSB-first (bit 0 of byte 0 is the first output sample).
+        The function automatically configures the counter low/high values based on
+        the bit count.
+
+        Parameters
+        ----------
+        channel : int
+            0-based channel / pin index.
+        bits : array-like of int (0 or 1), or np.ndarray of bool/uint8
+            The bit pattern to play.  Will be packed into bytes automatically.
+        """
+        bits = np.asarray(bits, dtype=np.uint8).flatten()
+        n_bits = len(bits)
+        # Pack bits into a byte array (LSB-first within each byte)
+        n_bytes = (n_bits + 7) // 8
+        byte_arr = np.zeros(n_bytes, dtype=np.uint8)
+        for i, b in enumerate(bits):
+            if b:
+                byte_arr[i // 8] |= 1 << (i % 8)
+        c_buf = byte_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
+        self._check(
+            self._dwf.FDwfDigitalOutDataSet(self._hdwf, channel, c_buf, n_bits),
+            "FDwfDigitalOutDataSet",
+        )
+
+    # ------------------------------------------------------------------
+    # Digital Out – Helper: compute divider & counts from seconds
+    # ------------------------------------------------------------------
+
+    def _digital_out_time_to_ticks(
+        self, seconds: float, channel: int = 0
+    ) -> Tuple[int, int]:
+        """
+        Convert a duration in seconds to ``(divider, tick_count)`` such that:
+        ``tick_count`` divider cycles ≈ ``seconds`` at the internal clock.
+
+        The divider is chosen to keep ``tick_count`` within the hardware counter
+        range (≤ 2^32 − 1) while maximising timing resolution.
+
+        Returns
+        -------
+        (divider, tick_count) : (int, int)
+            Both values are ≥ 1.
+        """
+        clk = self.digital_out_get_internal_clock()
+        total_ticks = round(clk * seconds)
+        if total_ticks < 1:
+            total_ticks = 1
+        MAX_COUNT = 0xFFFF_FFFF  # 32-bit counter
+        divider = 1
+        while total_ticks // divider > MAX_COUNT:
+            divider += 1
+        tick_count = max(1, round(total_ticks / divider))
+        return divider, tick_count
+
+    # ------------------------------------------------------------------
+    # Digital Out – High-level pulse helpers
+    # ------------------------------------------------------------------
+
+    def digital_out_pulse(
+        self,
+        pin: int,
+        high_time_s: float,
+        low_time_s: float,
+        idle_state: int = DwfDigitalOutIdleLow,
+        delay_s: float = 0.0,
+        pulse_count: int = 1,
+        output_mode: int = DwfDigitalOutOutputPushPull,
+        wait_for_done: bool = False,
+        timeout_s: float = 30.0,
+    ) -> None:
+        """
+        Generate one or more digital pulses on a single pin.
+
+        The pulse starts HIGH for ``high_time_s`` seconds, then goes LOW for
+        ``low_time_s`` seconds, and that pattern repeats ``pulse_count`` times.
+        Before the first edge the pin is held in ``idle_state``; after the last
+        pulse it returns to ``idle_state``.
+
+        Parameters
+        ----------
+        pin : int
+            0-based Digital Out channel / pin index.
+        high_time_s : float
+            Duration of the HIGH phase of each pulse, in seconds.
+        low_time_s : float
+            Duration of the LOW phase of each pulse, in seconds.
+        idle_state : int
+            Pin state while the instrument is not running.
+            DwfDigitalOutIdleLow (default), DwfDigitalOutIdleHigh,
+            DwfDigitalOutIdleInit, or DwfDigitalOutIdleZet.
+        delay_s : float
+            Time in seconds to wait after trigger (or start) before the first
+            edge.  Maps to FDwfDigitalOutWaitSet.  Default 0.
+        pulse_count : int
+            Number of complete HIGH→LOW cycles to generate.  0 = run
+            continuously until ``digital_out_configure(False)`` is called.
+        output_mode : int
+            Electrical output mode (push-pull, open-drain, …).
+        wait_for_done : bool
+            If True, block until the instrument reaches Done state or
+            ``timeout_s`` is exceeded.
+        timeout_s : float
+            Maximum time to wait when ``wait_for_done=True``.
+
+        Raises
+        ------
+        TimeoutError
+            If ``wait_for_done=True`` and Done state is not reached in time.
+
+        Example
+        -------
+        >>> # Single 1 ms pulse on pin 0 (idle low)
+        >>> dev.digital_out_pulse(pin=0, high_time_s=1e-3, low_time_s=1e-3)
+        """
+        self.digital_out_reset()
+
+        clk = self.digital_out_get_internal_clock()
+
+        # --- Compute divider (shared between high and low phases) -----
+        # Choose a divider that fits both high_time and low_time without
+        # exceeding the 32-bit counter limit.
+        MIN_TICKS = 1
+        MAX_COUNT = 0xFFFF_FFFF
+        total_high = max(MIN_TICKS, round(clk * high_time_s))
+        total_low  = max(MIN_TICKS, round(clk * low_time_s))
+        divider = 1
+        while (total_high // divider > MAX_COUNT or
+               total_low  // divider > MAX_COUNT):
+            divider += 1
+        high_ticks = max(1, round(total_high / divider))
+        low_ticks  = max(1, round(total_low  / divider))
+
+        # --- Channel configuration ------------------------------------
+        self.digital_out_enable_channel(pin, True)
+        self.digital_out_set_output_mode(pin, output_mode)
+        self.digital_out_set_type(pin, DwfDigitalOutTypePulse)
+        self.digital_out_set_idle(pin, idle_state)
+        self.digital_out_set_divider_init(pin, divider)
+        self.digital_out_set_divider(pin, divider)
+        # Start HIGH; initial hold = high_ticks (clean first pulse)
+        self.digital_out_set_counter_init(pin, start_high=True, initial_count=high_ticks)
+        self.digital_out_set_counter(pin, low_count=low_ticks, high_count=high_ticks)
+
+        if pulse_count > 0:
+            # Each pulse = 2 counter loads (high + low)
+            self.digital_out_set_repetition(pin, 2 * pulse_count)
+
+        # --- Global timing --------------------------------------------
+        self.digital_out_set_wait_time(delay_s)
+        if pulse_count > 0:
+            run_s = (high_time_s + low_time_s) * pulse_count
+            self.digital_out_set_run_time(run_s)
+        else:
+            self.digital_out_set_run_time(0)  # continuous
+
+        self.digital_out_set_repeat(1)
+        self.digital_out_configure(start=True)
+
+        if wait_for_done and pulse_count > 0:
+            deadline = time.time() + timeout_s
+            while True:
+                if self.digital_out_status() == DwfStateDone:
+                    break
+                if time.time() > deadline:
+                    raise TimeoutError(
+                        f"digital_out_pulse: did not complete within {timeout_s:.1f} s"
+                    )
+                time.sleep(0.001)
+
+    def digital_out_pulse_train(
+        self,
+        pins: List[int],
+        high_times_s: "List[float] | float",
+        low_times_s: "List[float] | float",
+        idle_states: "List[int] | int" = DwfDigitalOutIdleLow,
+        delay_s: float = 0.0,
+        pulse_count: int = 1,
+        output_modes: "List[int] | int" = DwfDigitalOutOutputPushPull,
+        wait_for_done: bool = False,
+        timeout_s: float = 30.0,
+    ) -> None:
+        """
+        Generate simultaneous pulse trains on multiple pins.
+
+        All channels share the same global trigger, wait-delay, repeat count, and
+        run-time, but each pin can have independent high/low durations and idle
+        states.  Scalar values for ``high_times_s``, ``low_times_s``,
+        ``idle_states``, or ``output_modes`` are broadcast to every pin.
+
+        Parameters
+        ----------
+        pins : list of int
+            0-based Digital Out channel / pin indices to drive.
+        high_times_s : float or list of float
+            HIGH-phase duration per pin (seconds).  A single float applies to
+            all pins.
+        low_times_s : float or list of float
+            LOW-phase duration per pin (seconds).  A single float applies to
+            all pins.
+        idle_states : int or list of int
+            Idle-state constant per pin.  Scalar broadcasts to all pins.
+            DwfDigitalOutIdleLow (default) | DwfDigitalOutIdleHigh |
+            DwfDigitalOutIdleInit | DwfDigitalOutIdleZet.
+        delay_s : float
+            Pre-output wait after trigger, in seconds (applies globally).
+        pulse_count : int
+            Number of complete HIGH→LOW cycles per pin.  0 = continuous.
+        output_modes : int or list of int
+            Output mode per pin.  Scalar broadcasts to all pins.
+        wait_for_done : bool
+            Block until the instrument reaches Done, or ``timeout_s`` elapses.
+        timeout_s : float
+            Host-side timeout used when ``wait_for_done=True``.
+
+        Raises
+        ------
+        ValueError
+            If a per-pin list length does not match ``len(pins)``.
+        TimeoutError
+            If ``wait_for_done=True`` and Done state is not reached in time.
+
+        Example
+        -------
+        >>> # Two-pin burst: pin 0 = 1 ms pulse, pin 1 = 500 µs pulse
+        >>> dev.digital_out_pulse_train(
+        ...     pins=[0, 1],
+        ...     high_times_s=[1e-3, 5e-4],
+        ...     low_times_s=[1e-3, 5e-4],
+        ...     pulse_count=5,
+        ...     wait_for_done=True,
+        ... )
+        """
+        n = len(pins)
+
+        def _broadcast(val, name: str) -> list:
+            if isinstance(val, (int, float)):
+                return [val] * n
+            lst = list(val)
+            if len(lst) != n:
+                raise ValueError(
+                    f"digital_out_pulse_train: '{name}' has {len(lst)} elements "
+                    f"but {n} pins were specified."
+                )
+            return lst
+
+        high_times  = _broadcast(high_times_s,  "high_times_s")
+        low_times   = _broadcast(low_times_s,   "low_times_s")
+        idles       = _broadcast(idle_states,   "idle_states")
+        out_modes   = _broadcast(output_modes,  "output_modes")
+
+        self.digital_out_reset()
+
+        clk = self.digital_out_get_internal_clock()
+        MIN_TICKS = 1
+        MAX_COUNT = 0xFFFF_FFFF
+
+        max_run_s = 0.0
+
+        for i, pin in enumerate(pins):
+            ht = high_times[i]
+            lt = low_times[i]
+
+            total_high = max(MIN_TICKS, round(clk * ht))
+            total_low  = max(MIN_TICKS, round(clk * lt))
+            divider = 1
+            while (total_high // divider > MAX_COUNT or
+                   total_low  // divider > MAX_COUNT):
+                divider += 1
+            high_ticks = max(1, round(total_high / divider))
+            low_ticks  = max(1, round(total_low  / divider))
+
+            self.digital_out_enable_channel(pin, True)
+            self.digital_out_set_output_mode(pin, out_modes[i])
+            self.digital_out_set_type(pin, DwfDigitalOutTypePulse)
+            self.digital_out_set_idle(pin, idles[i])
+            self.digital_out_set_divider_init(pin, divider)
+            self.digital_out_set_divider(pin, divider)
+            self.digital_out_set_counter_init(pin, start_high=True, initial_count=high_ticks)
+            self.digital_out_set_counter(pin, low_count=low_ticks, high_count=high_ticks)
+
+            if pulse_count > 0:
+                self.digital_out_set_repetition(pin, 2 * pulse_count)
+
+            max_run_s = max(max_run_s, (ht + lt) * pulse_count if pulse_count > 0 else 0.0)
+
+        # --- Global timing --------------------------------------------
+        self.digital_out_set_wait_time(delay_s)
+        if pulse_count > 0:
+            self.digital_out_set_run_time(max_run_s)
+        else:
+            self.digital_out_set_run_time(0)
+        self.digital_out_set_repeat(1)
+        self.digital_out_configure(start=True)
+
+        if wait_for_done and pulse_count > 0:
+            deadline = time.time() + timeout_s
+            while True:
+                if self.digital_out_status() == DwfStateDone:
+                    break
+                if time.time() > deadline:
+                    raise TimeoutError(
+                        f"digital_out_pulse_train: did not complete within "
+                        f"{timeout_s:.1f} s"
+                    )
+                time.sleep(0.001)
+
+    def digital_out_stop(self) -> None:
+        """Stop the pattern generator immediately."""
+        self.digital_out_configure(start=False)
 
     # ------------------------------------------------------------------
     # Trigger bus helpers

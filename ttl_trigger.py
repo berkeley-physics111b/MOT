@@ -119,7 +119,7 @@ class TTLTriggerMode(Enum):
 
     IMMEDIATE  — output starts as soon as the device receives the configure
                  command (lowest software latency path, but still subject to
-                 USB transfer time, ~1–2 ms).
+                 USB transfer time, ~1-2 ms).
     SOFTWARE   — output waits for an explicit ``FDwfDeviceTriggerPC`` call
                  (``trig.fire_software_trigger()``), allowing you to arm
                  the output in advance and fire it with a single fast call.
@@ -142,7 +142,7 @@ class TTLTriggerConfig:
     pins : list[int]
         One or more zero-based DIO pin indices to drive simultaneously.
         All listed pins receive identical timing.
-        Analog Discovery 2 has pins 0–15; ADP3450 has 0–31.
+        Analog Discovery 2 has pins 0-15; ADP3450 has 0-31.
     high_time_s : float
         Duration the pin is in its active (high or low, per polarity) state,
         in seconds.  Minimum is one device-clock period (~10 ns on AD2).
@@ -259,7 +259,7 @@ class TTLTrigger:
 
     def configure(self, cfg: TTLTriggerConfig) -> None:
         """
-        Programme the Digital Out instrument with the given ``TTLTriggerConfig``.
+        Program the Digital Out instrument with the given ``TTLTriggerConfig``.
 
         This call does **not** start the output — call ``fire()`` or
         ``fire_software_trigger()`` afterwards.
