@@ -1745,17 +1745,17 @@ class WaveFormsADS:
         self.digital_out_set_counter_init(pin, start_high=True, initial_count=high_ticks)
         self.digital_out_set_counter(pin, low_count=low_ticks, high_count=high_ticks)
 
-        if pulse_count > 0:
+        #if pulse_count > 0:
             # Each pulse = 2 counter loads (high + low)
-            self.digital_out_set_repetition(pin, 2 * pulse_count)
+            # self.digital_out_set_repetition(pin, 2 * pulse_count)
 
         # --- Global timing --------------------------------------------
         self.digital_out_set_wait_time(delay_s)
-        #if pulse_count > 0:
-        #    run_s = (high_time_s + low_time_s) * pulse_count
-        #    self.digital_out_set_run_time(run_s)
-        #else:
-        #    self.digital_out_set_run_time(0)  # continuous
+        if pulse_count > 0:
+            run_s = (high_time_s + low_time_s) * pulse_count
+            self.digital_out_set_run_time(run_s)
+        else:
+            self.digital_out_set_run_time(0)  # continuous
 
         self.digital_out_set_repeat(pulse_count)
         self.digital_out_configure(start=True)
