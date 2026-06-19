@@ -1696,13 +1696,12 @@ class WaveFormsADS:
             Time in seconds to wait after trigger (or start) before the first
             edge.  Maps to FDwfDigitalOutWaitSet.  Default 0.
         pulse_count : int
-            Number of complete HIGH→LOW cycles to generate.  0 = run
-            continuously until ``digital_out_configure(False)`` is called.
+            Number of complete HIGH→LOW cycles to generate.
         output_mode : int
             Electrical output mode (push-pull, open-drain, …).
         wait_for_done : bool
             If True, block until the instrument reaches Done state or
-            ``timeout_s`` is exceeded (n/a for continuous runs).
+            ``timeout_s`` is exceeded.
         timeout_s : float
             Maximum time to wait when ``wait_for_done=True``.
 
@@ -1745,17 +1744,20 @@ class WaveFormsADS:
         self.digital_out_set_counter_init(pin, start_high=True, initial_count=high_ticks)
         self.digital_out_set_counter(pin, low_count=low_ticks, high_count=high_ticks)
 
+        if pulse_count < 1:
+            raise ValueError(f"digital_out_pulse: pulse_count of {pulse_count} is less than 1")
+
         #if pulse_count > 0:
             # Each pulse = 2 counter loads (high + low)
             # self.digital_out_set_repetition(pin, 2 * pulse_count)
 
         # --- Global timing --------------------------------------------
         self.digital_out_set_wait_time(delay_s)
-        if pulse_count > 0:
-            run_s = (high_time_s + low_time_s) * pulse_count
-            self.digital_out_set_run_time(run_s)
-        else:
-            self.digital_out_set_run_time(0)  # continuous
+        #if pulse_count > 0:
+        #    run_s = (high_time_s + low_time_s) * pulse_count
+        #    self.digital_out_set_run_time(run_s)
+        #else:
+        #    self.digital_out_set_run_time(0)  # continuous
 
         self.digital_out_set_repeat(pulse_count)
         self.digital_out_configure(start=True)
