@@ -1702,7 +1702,7 @@ class WaveFormsADS:
             Electrical output mode (push-pull, open-drain, …).
         wait_for_done : bool
             If True, block until the instrument reaches Done state or
-            ``timeout_s`` is exceeded.
+            ``timeout_s`` is exceeded (n/a for continuous runs).
         timeout_s : float
             Maximum time to wait when ``wait_for_done=True``.
 
@@ -1751,13 +1751,13 @@ class WaveFormsADS:
 
         # --- Global timing --------------------------------------------
         self.digital_out_set_wait_time(delay_s)
-        if pulse_count > 0:
-            run_s = (high_time_s + low_time_s) * pulse_count
-            self.digital_out_set_run_time(run_s)
-        else:
-            self.digital_out_set_run_time(0)  # continuous
+        #if pulse_count > 0:
+        #    run_s = (high_time_s + low_time_s) * pulse_count
+        #    self.digital_out_set_run_time(run_s)
+        #else:
+        #    self.digital_out_set_run_time(0)  # continuous
 
-        self.digital_out_set_repeat(1)
+        self.digital_out_set_repeat(pulse_count)
         self.digital_out_configure(start=True)
 
         if wait_for_done and pulse_count > 0:
