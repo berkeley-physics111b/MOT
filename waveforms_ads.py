@@ -1422,10 +1422,10 @@ class WaveFormsADS:
         channel : int
             0-based channel / pin index.
         out_type : int
-            DwfDigitalOutTypePulse  – hardware counter-based pulse (most precise),
-            DwfDigitalOutTypeCustom – arbitrary bit-pattern from a buffer,
-            DwfDigitalOutTypeRandom – pseudo-random bit stream,
-            DwfDigitalOutTypeROM    – DIO input pins address a lookup table.
+            DwfDigitalOutTypePulse  - hardware counter-based pulse (most precise),
+            DwfDigitalOutTypeCustom - arbitrary bit-pattern from a buffer,
+            DwfDigitalOutTypeRandom - pseudo-random bit stream,
+            DwfDigitalOutTypeROM    - DIO input pins address a lookup table.
         """
         self._check(
             self._dwf.FDwfDigitalOutTypeSet(self._hdwf, channel, out_type),
@@ -1443,10 +1443,10 @@ class WaveFormsADS:
         channel : int
             0-based channel / pin index.
         idle : int
-            DwfDigitalOutIdleLow  – drive low,
-            DwfDigitalOutIdleHigh – drive high,
-            DwfDigitalOutIdleInit – use the counter-init level,
-            DwfDigitalOutIdleZet  – hi-Z / three-state.
+            DwfDigitalOutIdleLow  - drive low,
+            DwfDigitalOutIdleHigh - drive high,
+            DwfDigitalOutIdleInit - use the counter-init level,
+            DwfDigitalOutIdleZet  - hi-Z / three-state.
         """
         self._check(
             self._dwf.FDwfDigitalOutIdleSet(self._hdwf, channel, idle),
@@ -1638,7 +1638,7 @@ class WaveFormsADS:
         ``tick_count`` divider cycles ≈ ``seconds`` at the internal clock.
 
         The divider is chosen to keep ``tick_count`` within the hardware counter
-        range (≤ 2^32 − 1) while maximising timing resolution.
+        range (≤ 2^32 - 1) while maximising timing resolution.
 
         Returns
         -------
@@ -1744,21 +1744,13 @@ class WaveFormsADS:
         self.digital_out_set_counter_init(pin, start_high=True, initial_count=high_ticks)
         self.digital_out_set_counter(pin, low_count=low_ticks, high_count=high_ticks)
 
-        #if pulse_count > 0:
-            # Each pulse = 2 counter loads (high + low)
-            # self.digital_out_set_repetition(pin, 2 * pulse_count)
-
         # --- Global timing --------------------------------------------
         self.digital_out_set_wait_time(delay_s)
-        #if pulse_count > 0:
-        #    run_s = (high_time_s + low_time_s) * pulse_count
-        #    self.digital_out_set_run_time(run_s)
-        #else:
-        #    self.digital_out_set_run_time(0)  # continuous
-        run_s = high_time_s + low_time_s
+        
+        run_s = (high_time_s + low_time_s) * pulse_count
         self.digital_out_set_run_time(run_s)
 
-        self.digital_out_set_repeat(pulse_count)
+        self.digital_out_set_repeat(1)
         self.digital_out_configure(start=True)
 
         if wait_for_done and pulse_count > 0:
