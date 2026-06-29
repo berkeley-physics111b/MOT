@@ -357,8 +357,8 @@ class CoreInstrumentApplication(tk.Tk):
         ttk.Button(action_box, text="Capture Snapshot Now", command=self.execute_immediate_snapshot).pack(fill="x", pady=2)
         ttk.Button(action_box, text="Extract & Save Background", command=self.capture_background_profile).pack(fill="x", pady=2)
         
-        self.btn_master_pulse = tk.Button(action_box, text="Pulse", bg="#d32f2f", fg="white", font=("Arial", 11, "bold"), command=self.execute_master_pulse_routine)
-        self.btn_master_pulse.pack(fill="x", pady=6)
+        self.btn_synch_pulse = tk.Button(action_box, text="Pulse", bg="#2f2525", fg="white", font=("Arial", 11, "bold"), command=self.execute_synch_pulse_routine)
+        self.btn_synch_pulse.pack(fill="x", pady=6)
 
         # Live Display Canvas Layout
         self.camera_canvas = tk.Canvas(video_frame, bg="#0d0d0d", bd=1, relief="sunken")
@@ -752,13 +752,13 @@ class CoreInstrumentApplication(tk.Tk):
             print(f"[Storage Matrix] No pulsed snapshot to save")
 
     # =========================================================================
-    # THE MASTER SYNCHRONIZED TIMING PULSE SEQUENCE ENGINE
+    # THE SYNCHRONIZED TIMING PULSE SEQUENCE ENGINE
     # =========================================================================
 
-    def execute_master_pulse_routine(self):
+    def execute_synch_pulse_routine(self):
         """Coordinates multi-instrument synchronized execution across an asynchronous worker pool."""
         # Visual indicators locking downstream operations
-        self.btn_master_pulse.config(text="RUNNING SEQUENCE...", state="disabled")
+        self.btn_synch_pulse.config(text="RUNNING SEQUENCE...", state="disabled")
         self.live_view_active = False # Pause top-right continuous loop tracking
 
         # take_snapshot()/arm_hardware_trigger() both raise if continuous
@@ -972,7 +972,7 @@ class CoreInstrumentApplication(tk.Tk):
 
     def reset_interface_execution_safeguards(self):
         """Re-enables the GUI inputs and resumes the live video processing loop safely."""
-        self.btn_master_pulse.config(text="FIRE MASTER PULSE", state="normal")
+        self.btn_synch_pulse.config(text="PULSE", state="normal")
         self.live_view_active = True
         self._start_camera_live_view()
 
