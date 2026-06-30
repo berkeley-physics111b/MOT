@@ -11,10 +11,15 @@ import cv2
 from PIL import Image, ImageTk
 
 # Import the custom hardware wrappers provided in your environment
-from waveforms_ads import WaveFormsADS, DwfDigitalOutIdleLow, DwfDigitalOutIdleHigh
+from waveforms_ads import (
+    WaveFormsADS,
+    DwfDigitalOutIdleLow, DwfDigitalOutIdleHigh,
+    DwfStateDone,
+    trigsrcDetectorDigitalIn,
+)
 from allied_vision_camera import AlliedVisionCamera, CameraConfig, HardwareTriggerConfig, TriggerActivation, TriggerSelector, AcquisitionMode
 
-# The hardware wrapper modules (allied_vision_camera,
+# The hardware wrapper modules (allied_vision_camera, ttl_trigger,
 # waveforms_ads) attach a NullHandler to their own loggers so they stay
 # silent when imported as libraries. Without a handler configured here,
 # real warnings/errors raised inside those modules (bad ROI, dropped
@@ -217,58 +222,138 @@ class CoreInstrumentApplication(tk.Tk):
         self.render_sequence_preview_graph()
 
     def render_sequence_preview_graph(self):
-        """Draws a multi-channel timing schematic inside the UI without relying on matplotlib."""
+        """Draws a multi-channel timing schematic with a real time axis and repeated pulses."""
         self.sequence_canvas.delete("all")
-        w = self.sequence_canvas.winfo_width() if self.sequence_canvas.winfo_width() > 50 else 400
+        w = self.sequence_canvas.winfo_width() if self.sequence_canvas.winfo_width() > 50 else 500
         h = 140
-        
-        # Draw horizontal channels lines for Magnet, Shutter, and Camera Triggers
-        self.sequence_canvas.create_text(45, 25, text="Mag (DIO 0)", fill="#4caf50", font=("Consolas", 9))
-        self.sequence_canvas.create_line(90, 25, w-20, 25, fill="#333333", dash=(4,4))
-        
-        self.sequence_canvas.create_text(45, 65, text="Shut (DIO 1)", fill="#2196f3", font=("Consolas", 9))
-        self.sequence_canvas.create_line(90, 65, w-20, 65, fill="#333333", dash=(4,4))
-        
-        self.sequence_canvas.create_text(45, 105, text="Cam (DIO 2)", fill="#ff9800", font=("Consolas", 9))
-        self.sequence_canvas.create_line(90, 105, w-20, 105, fill="#333333", dash=(4,4))
 
-        # Basic relative geometric pulses step tracking
         try:
-            snap_delay = self.var_time_after_pulse.get()
-            pd3_domain = self.var_pd3_window.get()
-            
-            # Map pulse widths graphically onto the localized domain
-            start_x = 120
-            shutter_end_x = start_x + int(pd3_domain * 2)
-            cam_trigger_x = start_x + int(snap_delay * 2)
-
-            # Cap boundaries to canvas width
-            shutter_end_x = min(shutter_end_x, w - 20)
-            cam_trigger_x = min(cam_trigger_x, w - 20)
-
-            # Draw representative traces
-            # Magnet Power Line
-            self.sequence_canvas.create_line(90, 25, start_x, 25, fill="#4caf50", width=2)
-            self.sequence_canvas.create_line(start_x, 25, start_x, 10, fill="#4caf50", width=2)
-            self.sequence_canvas.create_line(start_x, 10, shutter_end_x, 10, fill="#4caf50", width=2)
-            self.sequence_canvas.create_line(shutter_end_x, 10, shutter_end_x, 25, fill="#4caf50", width=2)
-            self.sequence_canvas.create_line(shutter_end_x, 25, w-20, 25, fill="#4caf50", width=2)
-
-            # Shutter Trace
-            self.sequence_canvas.create_line(90, 65, start_x, 65, fill="#2196f3", width=2)
-            self.sequence_canvas.create_line(start_x, 65, start_x, 50, fill="#2196f3", width=2)
-            self.sequence_canvas.create_line(start_x, 50, shutter_end_x, 50, fill="#2196f3", width=2)
-            self.sequence_canvas.create_line(shutter_end_x, 50, shutter_end_x, 65, fill="#2196f3", width=2)
-            self.sequence_canvas.create_line(shutter_end_x, 65, w-20, 65, fill="#2196f3", width=2)
-
-            # Camera Sync Trace
-            self.sequence_canvas.create_line(90, 105, cam_trigger_x, 105, fill="#ff9800", width=2)
-            self.sequence_canvas.create_line(cam_trigger_x, 105, cam_trigger_x, 90, fill="#ff9800", width=2)
-            self.sequence_canvas.create_line(cam_trigger_x, 90, cam_trigger_x + 15, 90, fill="#ff9800", width=2)
-            self.sequence_canvas.create_line(cam_trigger_x + 15, 90, cam_trigger_x + 15, 105, fill="#ff9800", width=2)
-            self.sequence_canvas.create_line(cam_trigger_x + 15, 105, w-20, 105, fill="#ff9800", width=2)
+            snap_delay_ms   = self.var_time_after_pulse.get()
+            pd3_domain_ms   = self.var_pd3_window.get()
+            between_s       = self.var_time_between_pulses.get()
+            num_pulses      = max(1, self.var_num_pulses.get())
         except Exception:
-            pass # Suppress entry parsing hiccups during typing transitions
+            return  # suppress entry-parsing hiccups during typing
+
+        # Total time window to display (ms)
+        between_ms   = between_s * 1000.0
+        total_ms     = (pd3_domain_ms + between_ms) * num_pulses
+        if total_ms <= 0:
+            return
+
+        # Layout constants
+        LEFT_MARGIN  = 70   # px for channel labels
+        RIGHT_MARGIN = 10
+        TOP_MARGIN   = 8
+        AXIS_HEIGHT  = 18   # px for the time axis at the bottom
+        plot_w = w - LEFT_MARGIN - RIGHT_MARGIN
+        plot_h = h - TOP_MARGIN - AXIS_HEIGHT
+
+        # Three channels; each gets 1/3 of plot_h
+        ch_h     = plot_h // 3
+        channels = [
+            ("Mag DIO0", "#4caf50",  0),
+            ("Sht DIO1", "#2196f3",  1),
+            ("Cam DIO2", "#ff9800",  2),
+        ]
+
+        def t2x(t_ms):
+            return LEFT_MARGIN + (t_ms / total_ms) * plot_w
+
+        def row_y(row):
+            """Return the baseline y for channel row (0-based)."""
+            return TOP_MARGIN + row * ch_h + ch_h
+
+        # Draw channel labels and baseline
+        for row, (label, color, _pin) in enumerate(channels):
+            base_y = row_y(row)
+            self.sequence_canvas.create_text(
+                LEFT_MARGIN - 4, base_y - ch_h // 2,
+                text=label, fill=color, font=("Consolas", 8), anchor="e"
+            )
+            self.sequence_canvas.create_line(
+                LEFT_MARGIN, base_y, w - RIGHT_MARGIN, base_y,
+                fill="#2a2a2a", dash=(3, 4)
+            )
+
+        # Draw pulses for each channel
+        for row, (label, color, pin) in enumerate(channels):
+            base_y = row_y(row)
+            high_y = base_y - int(ch_h * 0.75)
+
+            t = 0.0
+            # Lead-in flat line
+            x0 = t2x(0)
+            for p in range(num_pulses):
+                # Rising edge
+                x_rise = t2x(t)
+                # High phase
+                t_fall = t + pd3_domain_ms
+                x_fall = t2x(t_fall)
+                # Falling edge, then low until next pulse
+                t_next = t + pd3_domain_ms + between_ms
+                x_next = t2x(min(t_next, total_ms))
+
+                # Camera sync pin (DIO 2) fires at snap_delay_ms after pulse start
+                if pin == 2:
+                    t_cam_rise = t + snap_delay_ms
+                    t_cam_fall = t_cam_rise + min(5.0, pd3_domain_ms * 0.1)  # narrow blip
+                    if t_cam_rise < total_ms:
+                        xc0 = t2x(t_cam_rise)
+                        xc1 = t2x(min(t_cam_fall, total_ms))
+                        # flat low before blip
+                        self.sequence_canvas.create_line(x0, base_y, xc0, base_y, fill=color, width=1)
+                        # rising
+                        self.sequence_canvas.create_line(xc0, base_y, xc0, high_y, fill=color, width=1)
+                        # high
+                        self.sequence_canvas.create_line(xc0, high_y, xc1, high_y, fill=color, width=1)
+                        # falling
+                        self.sequence_canvas.create_line(xc1, high_y, xc1, base_y, fill=color, width=1)
+                        x0 = xc1
+                else:
+                    # flat low before rise
+                    self.sequence_canvas.create_line(x0, base_y, x_rise, base_y, fill=color, width=1)
+                    # rising edge
+                    self.sequence_canvas.create_line(x_rise, base_y, x_rise, high_y, fill=color, width=1)
+                    # high phase
+                    self.sequence_canvas.create_line(x_rise, high_y, x_fall, high_y, fill=color, width=1)
+                    # falling edge
+                    self.sequence_canvas.create_line(x_fall, high_y, x_fall, base_y, fill=color, width=1)
+                    x0 = x_fall
+
+                t = t_next
+
+            # Tail flat line to end
+            x_end = t2x(total_ms)
+            self.sequence_canvas.create_line(x0, base_y, x_end, base_y, fill=color, width=1)
+
+        # Time axis
+        axis_y = TOP_MARGIN + plot_h + 2
+        self.sequence_canvas.create_line(
+            LEFT_MARGIN, axis_y, w - RIGHT_MARGIN, axis_y, fill="#555555", width=1
+        )
+
+        # Tick marks: aim for ~5 ticks
+        n_ticks = 5
+        tick_step_ms = total_ms / n_ticks
+        # Round to a nice number
+        for scale in [0.001, 0.01, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]:
+            if scale >= tick_step_ms * 0.5:
+                tick_step_ms = scale
+                break
+
+        t_tick = 0.0
+        while t_tick <= total_ms + tick_step_ms * 0.01:
+            xt = t2x(min(t_tick, total_ms))
+            self.sequence_canvas.create_line(xt, axis_y, xt, axis_y + 4, fill="#555555")
+            if t_tick < 1000:
+                lbl = f"{t_tick:.0f}ms" if t_tick == int(t_tick) else f"{t_tick:.1f}ms"
+            else:
+                lbl = f"{t_tick/1000:.1f}s"
+            self.sequence_canvas.create_text(
+                xt, axis_y + 10, text=lbl, fill="#666666", font=("Consolas", 7), anchor="n"
+            )
+            t_tick += tick_step_ms
 
     def build_top_right_panel(self):
         """Live video viewport and camera configuration settings controls."""
@@ -790,159 +875,130 @@ class CoreInstrumentApplication(tk.Tk):
                 
                 print(f"[Pulse Engine] Commencing {total_pulses} synchronized hardware triggers...")
 
-                # 2. Check and configure the Analog In (Oscilloscope) Instrument if hardware is connected
-                if self.ads:
-                    scope_sample_rate = 100000.0 # 100 kHz standard sampling requirement
-                    scope_buffer_samples = int(scope_sample_rate * pd3_domain_s)
-                    scope_buffer_samples = max(1024, scope_buffer_samples) # DWF requires clean base window scales
-                    
-                    self.ads.analog_in_reset()
-                    self.ads.analog_in_channel_enable(channel=0, enable=True)
-                    self.ads.analog_in_set_sample_rate(scope_sample_rate)
-                    self.ads.analog_in_set_buffer_size(scope_buffer_samples)
-                    
-                    # Set up hardware triggering off the synchronized digital bus line
-                    # trigsrcDigitalIn (3 or 5) gates the buffer storage sweep seamlessly
-                    self.ads.analog_in_set_trigger_source(3)
-                    self.ads.analog_in_set_trigger_type(0) # Edge triggering
-                    self.ads.analog_in_set_trigger_condition(0) # Rising edge
-                    
-                    # Arm the oscilloscope engine to wait for the upcoming digital pulse
-                    self.ads.analog_in_configure(reconfigure=True, start=True)
+                # Scope buffer size -- computed early so the variable is always
+                # in scope for the data-read block at the bottom.
+                scope_sample_rate    = 100000.0  # 100 kHz
+                scope_buffer_samples = max(1024, int(scope_sample_rate * pd3_domain_s))
 
-                # 3. Arm and prepare the Camera for the incoming hardware TTL trigger edge
-                if self.camera and self.camera._cam:
-                    # Use whatever GPIO line / trigger selector the user has
-                    # picked in the "Hardware Trigger Wiring" dropdowns,
-                    # which are populated from this specific camera's
-                    # actual reported entries -- not a hardcoded "Line1" /
-                    # "FrameStart" guess that may not exist on this model.
-                    
-                    print("[Pulse Engine Camera] Using software trigger instead of hardware trigger for now...")
-                    """
-                    trigger_line = self.var_trigger_line.get()
-                    trigger_selector_str = self.var_trigger_selector.get()
-                    try:
-                        trigger_selector = TriggerSelector(trigger_selector_str)
-                    except ValueError:
-                        # This camera reports a selector name our enum
-                        # wrapper doesn't know about. FrameStart is the one
-                        # virtually every trigger-capable GenICam camera
-                        # supports, so fall back to it rather than failing
-                        # outright.
-                        print(f"[Pulse Engine] Unrecognized trigger selector '{trigger_selector_str}'; defaulting to FrameStart.")
-                        trigger_selector = TriggerSelector.FRAME_START
-
-                    hw_trigger_config = HardwareTriggerConfig(
-                        line=trigger_line,
-                        activation=TriggerActivation.RISING_EDGE,
-                        selector=trigger_selector,
-                        acquisition_mode=AcquisitionMode.SINGLE_FRAME,
-                        timeout_s=5.0
-                    )
-                    try:
-                        self.camera.arm_hardware_trigger(hw_trigger_config)
-                    except Exception as arm_err:
-                        raise RuntimeError(
-                            f"Could not arm camera hardware trigger with line='{trigger_line}', "
-                            f"selector='{trigger_selector_str}': {arm_err}. This camera reports "
-                            f"available lines={self.available_trigger_lines or 'unknown'} and "
-                            f"trigger selectors={self.available_trigger_selectors or 'unknown'} -- "
-                            f"pick matching values in the Hardware Trigger Wiring panel."
-                        ) from arm_err
-                    """
-
-                # 4. Fire the pattern generator directly via the ADS digital-out engine.
+                # 2. Program the Digital Out pattern generator.
                 #
-                # The Digital Out instrument (pattern generator) and the
-                # Digital I/O instrument share the same physical pins but are
-                # independent ADS sub-systems.  digital_out_pulse_train()
-                # programs the on-device FPGA clock engine and then starts it;
-                # we pass wait_for_done=False here and block manually below on
-                # a separate thread so we can also wait for the oscilloscope
-                # at the same time.
+                # digital_out_pulse_train() calls digital_out_reset() internally,
+                # which on some ADS firmware revisions disturbs other instruments.
+                # We do this BEFORE arming the oscilloscope so the reset can't
+                # clobber the scope arm that follows.  We pass wait_for_done=False
+                # here and manage completion ourselves via a threading.Event below.
                 #
                 # Pin roles:
-                #   DIO 0 – magnet coil (only included if sync checkbox is on;
-                #            when included the pulse temporarily overrides the
-                #            static Digital I/O level for the coil)
+                #   DIO 0 – magnet coil  (only when "Synchronize" checkbox is on)
                 #   DIO 1 – shutter
                 #   DIO 2 – camera sync
+                #
+                # high_time_s  = duration the pin stays HIGH per pulse (pd3 window)
+                # low_time_s   = idle time BETWEEN pulses; the pulse train is
+                #                HIGH for pd3_domain_s then LOW for time_between_pulses,
+                #                repeated total_pulses times.
+                pulse_done_event = threading.Event()
+                pulse_error      = [None]
+
                 if self.ads:
-                    pulse_pins = [1, 2]  # shutter + camera sync always fired
-                    pulse_high_times = [pd3_domain_s, pd3_domain_s]
-                    pulse_low_times  = [self.var_time_between_pulses.get(),
-                                        self.var_time_between_pulses.get()]
+                    between_s   = self.var_time_between_pulses.get()
+                    pulse_pins  = [1, 2]
+                    pulse_highs = [pd3_domain_s, pd3_domain_s]
+                    pulse_lows  = [between_s, between_s]
 
                     if self.var_sync_pulse.get():
-                        # Include magnet coil in the synchronized burst.
                         pulse_pins.insert(0, 0)
-                        pulse_high_times.insert(0, pd3_domain_s)
-                        pulse_low_times.insert(0, self.var_time_between_pulses.get())
+                        pulse_highs.insert(0, pd3_domain_s)
+                        pulse_lows.insert(0, between_s)
 
-                    # Determine how long to wait for the pulse train.
-                    # Each cycle = high_time + low_time; total = cycles * that.
-                    # Add a 500 ms safety margin for ADS internal startup.
-                    total_run_s = (pd3_domain_s + self.var_time_between_pulses.get()) * total_pulses
-                    pulse_timeout_s = total_run_s + 0.5
+                    total_run_s   = (pd3_domain_s + between_s) * total_pulses
+                    pulse_timeout = total_run_s + 1.0
 
-                    # Run the blocking wait on a dedicated thread so the
-                    # oscilloscope poll below can proceed concurrently.
-                    pulse_done_event = threading.Event()
-                    pulse_error = [None]
+                    print(f"[Pulse Engine] Programming digital_out: pins={pulse_pins} "
+                          f"high={pd3_domain_s*1000:.1f}ms low={between_s*1000:.0f}ms "
+                          f"x{total_pulses} (run={total_run_s:.3f}s)")
 
-                    def _fire_pulse():
+                    # Pre-program the generator (resets it internally); do NOT
+                    # start it yet -- we pass wait_for_done=False and fire via
+                    # digital_out_configure() after the scope is armed.
+                    self.ads.digital_out_pulse_train(
+                        pins=pulse_pins,
+                        high_times_s=pulse_highs,
+                        low_times_s=pulse_lows,
+                        idle_states=DwfDigitalOutIdleLow,
+                        pulse_count=total_pulses,
+                        wait_for_done=False,
+                    )
+
+                    # digital_out_pulse_train with wait_for_done=False still
+                    # calls digital_out_configure(start=True) at the end, so
+                    # the generator is already running.  Spawn a watcher thread
+                    # that polls for Done and sets the event when finished.
+                    def _wait_pulse_done():
                         try:
-                            self.ads.digital_out_pulse_train(
-                                pins=pulse_pins,
-                                high_times_s=pulse_high_times,
-                                low_times_s=pulse_low_times,
-                                idle_states=DwfDigitalOutIdleLow,
-                                pulse_count=total_pulses,
-                                wait_for_done=True,
-                                timeout_s=pulse_timeout_s,
-                            )
+                            deadline = time.time() + pulse_timeout
+                            while True:
+                                if self.ads.digital_out_status() == DwfStateDone:
+                                    print("[Pulse Engine] digital_out Done.")
+                                    break
+                                if time.time() > deadline:
+                                    pulse_error[0] = TimeoutError(
+                                        f"Pulse did not finish within {pulse_timeout:.1f}s"
+                                    )
+                                    break
+                                time.sleep(0.005)
                         except Exception as _e:
                             pulse_error[0] = _e
                         finally:
                             pulse_done_event.set()
 
-                    pulse_thread = threading.Thread(target=_fire_pulse, daemon=True)
-                    pulse_thread.start()
+                    threading.Thread(target=_wait_pulse_done, daemon=True).start()
+                else:
+                    # No ADS connected; signal immediately so the rest of the
+                    # sequence doesn't block forever.
+                    pulse_done_event.set()
 
-                # 5. Collect the data arrays captured by the external instruments concurrently
-                # Catch the camera frame via the asynchronous worker thread
+                # 3. NOW arm the oscilloscope (after digital_out is already
+                # programmed and running, so no subsequent reset can hit it).
+                if self.ads:
+                    self.ads.analog_in_reset()
+                    self.ads.analog_in_channel_enable(channel=0, enable=True)
+                    self.ads.analog_in_set_sample_rate(scope_sample_rate)
+                    self.ads.analog_in_set_buffer_size(scope_buffer_samples)
+                    # Trigger on the rising edge of the Digital Out bus
+                    self.ads.analog_in_set_trigger_source(trigsrcDetectorDigitalIn)
+                    self.ads.analog_in_set_trigger_type(0)       # edge
+                    self.ads.analog_in_set_trigger_condition(0)  # rising
+                    self.ads.analog_in_configure(reconfigure=True, start=True)
+                    print(f"[Pulse Engine] Oscilloscope armed: {scope_buffer_samples} "
+                          f"samples @ {scope_sample_rate/1e3:.0f} kHz")
+
+                # 4. Take camera snapshot while pulse is running.
                 captured_frame = None
                 if self.camera and self.camera._cam:
                     try:
-                        #captured_frame = self.camera.wait_for_hardware_trigger(timeout_s=5.0)
-                        # temporarily using software trigger
+                        # TODO: switch to hardware trigger when wiring is confirmed
                         captured_frame = self.camera.take_snapshot()
                     except Exception as err:
-                        print(f"[Pulse Engine Camera Exception] Match trace drop: {err}")
-                    finally:
-                        #self.camera.disarm_hardware_trigger()
-                        pass
+                        print(f"[Pulse Engine Camera] Snapshot failed: {err}")
 
-                # Wait for the pulse thread to finish before reading scope data.
-                # (The scope trigger is gated on the digital bus, so the buffer
-                # may not be populated until the pulse has actually fired.)
-                if self.ads and 'pulse_done_event' in dir():
-                    pulse_done_event.wait(timeout=pulse_timeout_s + 1.0)
-                    if pulse_error[0]:
-                        print(f"[Pulse Engine] digital_out_pulse_train error: {pulse_error[0]}")
+                # 5. Wait for the pulse train to complete, then read scope data.
+                _wait_timeout = (total_run_s + 2.0) if self.ads else 1.0
+                pulse_done_event.wait(timeout=_wait_timeout)
+                if pulse_error[0]:
+                    print(f"[Pulse Engine] Pulse error: {pulse_error[0]}")
 
-                    # After the Digital Out engine finishes, restore the magnet
-                    # coil (DIO 0) to whatever the checkbox says.  The pulse
-                    # train temporarily overrides the static Digital I/O level.
-                    if self.var_sync_pulse.get():
-                        try:
-                            self.ads.digital_io_set_output_enable(0x07)
-                            self.ads.digital_io_write_pin(
-                                pin=0, value=bool(self.var_magnet_state.get())
-                            )
-                        except Exception as e:
-                            print(f"[Pulse Engine] Could not restore magnet state: {e}")
+                # After Digital Out finishes, restore DIO 0 (magnet) to
+                # whatever the checkbox says -- the pulse temporarily overrides
+                # the static Digital I/O level on that pin.
+                if self.ads and self.var_sync_pulse.get():
+                    try:
+                        self.ads.digital_io_set_output_enable(0x07)
+                        self.ads.digital_io_write_pin(
+                            pin=0, value=bool(self.var_magnet_state.get())
+                        )
+                    except Exception as _e:
+                        print(f"[Pulse Engine] Could not restore magnet state: {_e}")
 
                 # Poll and grab the oscilloscope data arrays
                 scope_voltages = np.array([])
@@ -950,8 +1006,12 @@ class CoreInstrumentApplication(tk.Tk):
                     timeout_limit = time.time() + 5.0
                     while True:
                         status = self.ads.analog_in_status(read_data=True)
-                        if status == 2: # DwfStateDone: Buffer collection completed
-                            scope_voltages = self.ads.analog_in_get_data(channel=0, n_samples=scope_buffer_samples)
+                        if status == 2:  # DwfStateDone
+                            scope_voltages = self.ads.analog_in_get_data(
+                                channel=0, n_samples=scope_buffer_samples
+                            )
+                            print(f"[Pulse Engine] Scope captured {len(scope_voltages)} samples, "
+                                  f"range [{scope_voltages.min():.3f}, {scope_voltages.max():.3f}] V")
                             break
                         if time.time() > timeout_limit:
                             print("[Pulse Engine Scope Timeout] Exceeded data collection window.")
