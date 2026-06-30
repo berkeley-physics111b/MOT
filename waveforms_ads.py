@@ -1875,9 +1875,6 @@ class WaveFormsADS:
             self.digital_out_set_counter_init(pin, start_high=True, initial_count=high_ticks)
             self.digital_out_set_counter(pin, low_count=low_ticks, high_count=high_ticks)
 
-            if pulse_count > 0:
-                self.digital_out_set_repetition(pin, 2 * pulse_count)
-
             max_run_s = max(max_run_s, (ht + lt) * pulse_count if pulse_count > 0 else 0.0)
 
         # --- Global timing --------------------------------------------
