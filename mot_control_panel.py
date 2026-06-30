@@ -887,23 +887,19 @@ class CoreInstrumentApplication(tk.Tk):
                 scope_sample_rate    = 100000.0  # 100 kHz
                 scope_buffer_samples = max(1024, int(scope_sample_rate * pd3_domain_s))
 
-                # 2. Program the Digital Out pattern generator.
+                # 2. Program and fire the Digital Out pattern generator.
                 #
-                # digital_out_pulse_train() calls digital_out_reset() internally,
-                # which on some ADS firmware revisions disturbs other instruments.
-                # We do this BEFORE arming the oscilloscope so the reset can't
-                # clobber the scope arm that follows.  We pass wait_for_done=False
-                # here and manage completion ourselves via a threading.Event below.
+                # digital_out_pulse_train() has been updated to no longer call
+                # the (unsupported-on-this-device) digital_out_set_repetition;
+                # it now relies purely on run_time + the per-channel
+                # divider/counter programming, which is the standard DWF
+                # approach. We call it directly with wait_for_done=True on a
+                # background thread so the main GUI doesn't block.
                 #
                 # Pin roles:
                 #   DIO 0 – magnet coil  (only when "Synchronize" checkbox is on)
                 #   DIO 1 – shutter
                 #   DIO 2 – camera sync
-                #
-                # high_time_s  = duration the pin stays HIGH per pulse (pd3 window)
-                # low_time_s   = idle time BETWEEN pulses; the pulse train is
-                #                HIGH for pd3_domain_s then LOW for time_between_pulses,
-                #                repeated total_pulses times.
                 pulse_done_event = threading.Event()
                 pulse_error      = [None]
 
@@ -919,100 +915,46 @@ class CoreInstrumentApplication(tk.Tk):
                         pulse_lows.insert(0, between_s)
 
                     total_run_s   = (pd3_domain_s + between_s) * total_pulses
-                    pulse_timeout = total_run_s + 1.0
+                    pulse_timeout = total_run_s + 2.0  # safety margin
 
                     print(f"[Pulse Engine] Programming digital_out: pins={pulse_pins} "
-                          f"high={pd3_domain_s*1000:.1f}ms low={between_s*1000:.0f}ms "
-                          f"x{total_pulses} (run={total_run_s:.3f}s)")
+                          f"high={pd3_domain_s*1000:.3f}ms low={between_s*1000:.1f}ms "
+                          f"x{total_pulses} (run={total_run_s:.4f}s)")
 
-                    # Program each channel manually (mirrors what
-                    # digital_out_pulse_train() does internally) so we can
-                    # control the exact call order and force the trigger
-                    # source to "none" (immediate) right before configure().
-                    #
-                    # WHY NOT JUST CALL digital_out_pulse_train()?
-                    # That helper calls digital_out_reset() first, then
-                    # programs each channel, then calls
-                    # digital_out_configure(start=True) at the very end --
-                    # but it never explicitly sets the trigger source. If a
-                    # previous session (or another instrument on this device)
-                    # left TriggerSource pointing at something other than
-                    # trigsrcNone, configure(start=True) puts the generator
-                    # into Armed/Wait state waiting for a trigger edge that
-                    # never arrives. No exception is raised -- the pins
-                    # simply never move, and digital_out_status() sits at
-                    # Armed/Wait until our host-side timeout silently expires.
-                    # That exactly matches the symptom reported ("no errors,
-                    # pins not moving").
-                    self.ads.digital_out_reset()
-
-                    clk = self.ads.digital_out_get_internal_clock()
-                    MIN_TICKS, MAX_COUNT = 1, 0xFFFF_FFFF
-
-                    for pin, ht, lt in zip(pulse_pins, pulse_highs, pulse_lows):
-                        total_high = max(MIN_TICKS, round(clk * ht))
-                        total_low  = max(MIN_TICKS, round(clk * lt))
-                        divider = 1
-                        while (total_high // divider > MAX_COUNT or
-                               total_low  // divider > MAX_COUNT):
-                            divider += 1
-                        high_ticks = max(1, round(total_high / divider))
-                        low_ticks  = max(1, round(total_low  / divider))
-
-                        self.ads.digital_out_enable_channel(pin, True)
-                        self.ads.digital_out_set_output_mode(pin, 0)  # push-pull
-                        self.ads.digital_out_set_type(pin, 0)         # pulse
-                        self.ads.digital_out_set_idle(pin, DwfDigitalOutIdleLow)
-                        self.ads.digital_out_set_divider_init(pin, divider)
-                        self.ads.digital_out_set_divider(pin, divider)
-                        self.ads.digital_out_set_counter_init(pin, start_high=True, initial_count=high_ticks)
-                        self.ads.digital_out_set_counter(pin, low_count=low_ticks, high_count=high_ticks)
-
-                    # Global timing
-                    self.ads.digital_out_set_wait_time(0.0)
-                    self.ads.digital_out_set_run_time(total_run_s)
-                    self.ads.digital_out_set_repeat(1)
+                    # Sanity-check the timing against the device's internal
+                    # clock BEFORE firing, so a degenerate (effectively-zero)
+                    # pulse width shows up in the console instead of just
+                    # silently producing no visible edge.
                     try:
-                        self.ads.digital_out_set_repeat_trigger(False)
+                        clk = self.ads.digital_out_get_internal_clock()
+                        min_high_ticks = round(clk * pd3_domain_s)
+                        if min_high_ticks < 1:
+                            print(f"[Pulse Engine][WARNING] high_time={pd3_domain_s*1e6:.1f}us "
+                                  f"rounds to <1 tick at clk={clk/1e6:.1f}MHz -- pulse will be "
+                                  f"effectively zero width and may not be visible.")
                     except Exception:
-                        pass  # not all firmware revisions expose this
+                        pass
 
-                    # Force immediate (untriggered) start -- see note above.
-                    self.ads.digital_out_set_trigger_source(0)  # trigsrcNone
-
-                    self.ads.digital_out_configure(start=True)
-                    print(f"[Pulse Engine] digital_out_configure(start=True) issued; "
-                          f"status={self.ads.digital_out_status()}")
-
-                    # Watcher thread: poll for Done state without blocking the
-                    # rest of the sequence (scope/camera run concurrently).
-                    def _wait_pulse_done():
+                    def _fire_pulse_train():
                         try:
-                            deadline = time.time() + pulse_timeout
-                            last_status = None
-                            while True:
-                                status = self.ads.digital_out_status()
-                                if status != last_status:
-                                    print(f"[Pulse Engine] digital_out status -> {status}")
-                                    last_status = status
-                                if status == DwfStateDone:
-                                    print("[Pulse Engine] digital_out Done.")
-                                    break
-                                if time.time() > deadline:
-                                    pulse_error[0] = TimeoutError(
-                                        f"Pulse did not finish within {pulse_timeout:.1f}s "
-                                        f"(stuck in status={status} -- if this is 1 (Armed) or "
-                                        f"7 (Wait), the generator is waiting on a trigger that "
-                                        f"never arrived)"
-                                    )
-                                    break
-                                time.sleep(0.005)
+                            self.ads.digital_out_pulse_train(
+                                pins=pulse_pins,
+                                high_times_s=pulse_highs,
+                                low_times_s=pulse_lows,
+                                idle_states=DwfDigitalOutIdleLow,
+                                pulse_count=total_pulses,
+                                wait_for_done=True,
+                                timeout_s=pulse_timeout,
+                            )
+                            print(f"[Pulse Engine] digital_out Done "
+                                  f"(status={self.ads.digital_out_status()}).")
                         except Exception as _e:
                             pulse_error[0] = _e
+                            print(f"[Pulse Engine] digital_out_pulse_train error: {_e}")
                         finally:
                             pulse_done_event.set()
 
-                    threading.Thread(target=_wait_pulse_done, daemon=True).start()
+                    threading.Thread(target=_fire_pulse_train, daemon=True).start()
                 else:
                     # No ADS connected; signal immediately so the rest of the
                     # sequence doesn't block forever.
