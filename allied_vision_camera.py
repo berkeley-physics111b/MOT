@@ -181,9 +181,9 @@ class HardwareTriggerConfig:
     selector:
         The acquisition event being gated (almost always ``FRAME_START``).
     acquisition_mode:
-        ``SINGLE_FRAME``  – camera waits for exactly one pulse then stops.
-        ``CONTINUOUS``    – camera fires on every pulse until disarmed.
-        ``MULTI_FRAME``   – camera fires on ``frame_count`` pulses.
+        ``SINGLE_FRAME``  - camera waits for exactly one pulse then stops.
+        ``CONTINUOUS``    - camera fires on every pulse until disarmed.
+        ``MULTI_FRAME``   - camera fires on ``frame_count`` pulses.
     frame_count:
         Used only when ``acquisition_mode == MULTI_FRAME``.
     trigger_delay_us:
@@ -215,14 +215,14 @@ class AlliedVisionCamera:
 
     Acquisition modes
     -----------------
-    1. **Continuous** – free-run, non-critical timing, used for live display.
+    1. **Continuous** - free-run, non-critical timing, used for live display.
        ``start_continuous()`` / ``stop_continuous()``
 
-    2. **Software-triggered snapshot** – single frame, timing-critical.
+    2. **Software-triggered snapshot** - single frame, timing-critical.
        Buffers pre-queued before trigger fires.
        ``take_snapshot()``
 
-    3. **Hardware-triggered acquisition** – external electrical signal on a
+    3. **Hardware-triggered acquisition** - external electrical signal on a
        GPIO line gates each frame.  Supports single, multi, and continuous
        hardware-trigger modes.
        ``arm_hardware_trigger()`` / ``wait_for_hardware_trigger()`` /
@@ -499,7 +499,7 @@ class AlliedVisionCamera:
         _log.debug("Pixel format changed to %s", fmt)
 
     # ------------------------------------------------------------------
-    # Continuous streaming  (non-critical timing – for live display)
+    # Continuous streaming  (non-critical timing - for live display)
     # ------------------------------------------------------------------
 
     def start_continuous(self, callback: Optional[FrameCallback] = None) -> None:
@@ -1024,7 +1024,7 @@ if __name__ == "__main__":
     # visible without flooding the console with routine status messages.
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
-    # Build a configuration – adjust values for your camera
+    # Build a configuration - adjust values for your camera
     config = CameraConfig(
         exposure_time_us=20_000,   # 20 ms
         gain=0.0,
@@ -1048,7 +1048,7 @@ if __name__ == "__main__":
         print("Available GPIO lines:", lines)
 
         # ---- Live view (non-blocking in script; blocks here for demo) ----
-        live_view(cam, window_title="Allied Vision – Live View")
+        live_view(cam, window_title="Allied Vision - Live View")
 
         # ---- Software-triggered snapshot ----
         print("Taking software-triggered snapshot …")

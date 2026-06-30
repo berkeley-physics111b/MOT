@@ -993,7 +993,10 @@ class CoreInstrumentApplication(tk.Tk):
                 if self.camera and self.camera._cam:
                     try:
                         # TODO: switch to hardware trigger when wiring is confirmed
-                        captured_frame = self.camera.take_snapshot()
+                        # 'software trigger' not possible with old guppy (?) so removed
+                        # need to re-examine that function in allied_vision_camera.py
+                        self.execute_immediate_snapshot()
+                        captured_frame = self.latest_live_frame()
                     except Exception as err:
                         print(f"[Pulse Engine Camera] Snapshot failed: {err}")
 
