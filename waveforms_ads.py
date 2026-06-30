@@ -1176,7 +1176,7 @@ class WaveFormsADS:
     def digital_io_set_output_enable(self, pin_mask: int) -> None:
         """
         Configure pins as outputs using a bitmask.
-        Example: ``0x00FF`` makes pins 0–7 outputs, the rest inputs.
+        Example: ``0x00FF`` makes pins 0-7 outputs, the rest inputs.
         """
         self._check(
             self._dwf.FDwfDigitalIOOutputEnableSet(self._hdwf, pin_mask),

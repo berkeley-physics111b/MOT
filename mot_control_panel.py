@@ -11,11 +11,10 @@ import cv2
 from PIL import Image, ImageTk
 
 # Import the custom hardware wrappers provided in your environment
-from waveforms_ads import WaveFormsADS
-from ttl_trigger import TTLTrigger, TTLTriggerConfig, TTLIdleState, TTLPolarity, TTLTriggerMode
+from waveforms_ads import WaveFormsADS, DwfDigitalOutIdleLow, DwfDigitalOutIdleHigh
 from allied_vision_camera import AlliedVisionCamera, CameraConfig, HardwareTriggerConfig, TriggerActivation, TriggerSelector, AcquisitionMode
 
-# The hardware wrapper modules (allied_vision_camera, ttl_trigger,
+# The hardware wrapper modules (allied_vision_camera,
 # waveforms_ads) attach a NullHandler to their own loggers so they stay
 # silent when imported as libraries. Without a handler configured here,
 # real warnings/errors raised inside those modules (bad ROI, dropped
@@ -77,7 +76,6 @@ class CoreInstrumentApplication(tk.Tk):
 
         # Initialize Hardware Interface Objects
         self.ads = None
-        self.ttl_trig = None
         self.camera = None
         
         # State Arrays and Image Matrices
@@ -110,13 +108,11 @@ class CoreInstrumentApplication(tk.Tk):
         """Secure safe handles to the hardware layers."""
         try:
             self.ads = WaveFormsADS()
-            self.ttl_trig = TTLTrigger(self.ads)
             # Initialize DIO 0,1,2 as outputs explicitly if required by platform
             self.ads.digital_io_set_output_enable(0x07)
         except Exception as e:
             print(f"[Warning] Analog Discovery device could not connect: {e}")
             self.ads = None
-            self.ttl_trig = None
 
         # Discovered hardware-trigger vocabulary for the connected camera.
         # Different Allied Vision models expose different GPIO line names
@@ -501,21 +497,34 @@ class CoreInstrumentApplication(tk.Tk):
             messagebox.showerror("Hardware Communication Error", f"Unable to update camera settings block: {e}")
 
     def toggle_magnet_static_line(self):
-        """Drives manual state level adjustments across the static digital registers."""
+        """Drives manual state level adjustments across the static digital registers.
+
+        DIO 0 is the magnet coil.  Setting it high holds the magnet on
+        indefinitely; clearing it turns it off.  We use digital_io_write_pin()
+        (read-modify-write on the current output register) so we never disturb
+        the state of any other pin.
+
+        The Digital I/O write itself is instant, but we offload it to a
+        background thread anyway so that any unexpected ADS latency cannot
+        freeze the Tkinter main loop.
+        """
         if not self.ads:
             return
-        # Ensure pattern generator channels are fully closed to avoid system state locking
-        try:
-            self.ads.digital_io_reset()
-        except Exception:
-            pass
-            
-        state_bit = 1 if self.var_magnet_state.get() else 0
-        try:
-            self.ads.digital_io_set_output(0x00FF)
-            self.ads.digital_io_write_pin(pin=0, value=state_bit)
-        except Exception as e:
-            print(f"[Error] Failed static register write manipulation: {e}")
+
+        state_bit = bool(self.var_magnet_state.get())
+
+        def _write():
+            try:
+                # Ensure DIO 0-2 are still configured as outputs (a previous
+                # digital_out_reset() or digital_io_reset() call inside the
+                # pulse sequence can clear the output-enable mask).
+                self.ads.digital_io_set_output_enable(0x07)
+                self.ads.digital_io_write_pin(pin=0, value=state_bit)
+                print(f"[Magnet] DIO 0 set {'HIGH (on)' if state_bit else 'LOW (off)'}")
+            except Exception as e:
+                print(f"[Error] Failed magnet register write: {e}")
+
+        threading.Thread(target=_write, daemon=True).start()
 
     def browse_csv_destination_file(self):
         """Launches localized system directory browser to identify data dump locations."""
@@ -843,30 +852,63 @@ class CoreInstrumentApplication(tk.Tk):
                         ) from arm_err
                     """
 
-                # 4. Configure the hardware pattern generator lines via the custom controller
-                if self.ttl_trig:
-                    # Dynamically combine lines based on user settings checkboxes
-                    active_pins = [1, 2] # Default to Shutter (DIO 1) and Camera Sync (DIO 2)
+                # 4. Fire the pattern generator directly via the ADS digital-out engine.
+                #
+                # The Digital Out instrument (pattern generator) and the
+                # Digital I/O instrument share the same physical pins but are
+                # independent ADS sub-systems.  digital_out_pulse_train()
+                # programs the on-device FPGA clock engine and then starts it;
+                # we pass wait_for_done=False here and block manually below on
+                # a separate thread so we can also wait for the oscilloscope
+                # at the same time.
+                #
+                # Pin roles:
+                #   DIO 0 – magnet coil (only included if sync checkbox is on;
+                #            when included the pulse temporarily overrides the
+                #            static Digital I/O level for the coil)
+                #   DIO 1 – shutter
+                #   DIO 2 – camera sync
+                if self.ads:
+                    pulse_pins = [1, 2]  # shutter + camera sync always fired
+                    pulse_high_times = [pd3_domain_s, pd3_domain_s]
+                    pulse_low_times  = [self.var_time_between_pulses.get(),
+                                        self.var_time_between_pulses.get()]
+
                     if self.var_sync_pulse.get():
-                        active_pins.append(0) # Include Magnet (DIO 0) in the pattern block
-                    
-                    # Generate identical high/low phase times across the pattern bank
-                    pulse_config = TTLTriggerConfig(
-                        pins=active_pins,
-                        high_time_s=pd3_domain_s,
-                        low_time_s=self.var_time_between_pulses.get(),
-                        pulse_count=total_pulses,
-                        idle_state=TTLIdleState.LOW,
-                        polarity=TTLPolarity.ACTIVE_HIGH,
-                        mode=TTLTriggerMode.IMMEDIATE,
-                        delay_s=0.0
-                    )
-                    
-                    self.ttl_trig.configure(pulse_config)
-                    
-                    # Fire pattern generator lines directly
-                    # Device timing executes via FPGA clock arrays down at the 10ns precision floor
-                    self.ttl_trig.fire()
+                        # Include magnet coil in the synchronized burst.
+                        pulse_pins.insert(0, 0)
+                        pulse_high_times.insert(0, pd3_domain_s)
+                        pulse_low_times.insert(0, self.var_time_between_pulses.get())
+
+                    # Determine how long to wait for the pulse train.
+                    # Each cycle = high_time + low_time; total = cycles * that.
+                    # Add a 500 ms safety margin for ADS internal startup.
+                    total_run_s = (pd3_domain_s + self.var_time_between_pulses.get()) * total_pulses
+                    pulse_timeout_s = total_run_s + 0.5
+
+                    # Run the blocking wait on a dedicated thread so the
+                    # oscilloscope poll below can proceed concurrently.
+                    pulse_done_event = threading.Event()
+                    pulse_error = [None]
+
+                    def _fire_pulse():
+                        try:
+                            self.ads.digital_out_pulse_train(
+                                pins=pulse_pins,
+                                high_times_s=pulse_high_times,
+                                low_times_s=pulse_low_times,
+                                idle_states=DwfDigitalOutIdleLow,
+                                pulse_count=total_pulses,
+                                wait_for_done=True,
+                                timeout_s=pulse_timeout_s,
+                            )
+                        except Exception as _e:
+                            pulse_error[0] = _e
+                        finally:
+                            pulse_done_event.set()
+
+                    pulse_thread = threading.Thread(target=_fire_pulse, daemon=True)
+                    pulse_thread.start()
 
                 # 5. Collect the data arrays captured by the external instruments concurrently
                 # Catch the camera frame via the asynchronous worker thread
@@ -882,6 +924,26 @@ class CoreInstrumentApplication(tk.Tk):
                         #self.camera.disarm_hardware_trigger()
                         pass
 
+                # Wait for the pulse thread to finish before reading scope data.
+                # (The scope trigger is gated on the digital bus, so the buffer
+                # may not be populated until the pulse has actually fired.)
+                if self.ads and 'pulse_done_event' in dir():
+                    pulse_done_event.wait(timeout=pulse_timeout_s + 1.0)
+                    if pulse_error[0]:
+                        print(f"[Pulse Engine] digital_out_pulse_train error: {pulse_error[0]}")
+
+                    # After the Digital Out engine finishes, restore the magnet
+                    # coil (DIO 0) to whatever the checkbox says.  The pulse
+                    # train temporarily overrides the static Digital I/O level.
+                    if self.var_sync_pulse.get():
+                        try:
+                            self.ads.digital_io_set_output_enable(0x07)
+                            self.ads.digital_io_write_pin(
+                                pin=0, value=bool(self.var_magnet_state.get())
+                            )
+                        except Exception as e:
+                            print(f"[Pulse Engine] Could not restore magnet state: {e}")
+
                 # Poll and grab the oscilloscope data arrays
                 scope_voltages = np.array([])
                 if self.ads:
@@ -889,7 +951,7 @@ class CoreInstrumentApplication(tk.Tk):
                     while True:
                         status = self.ads.analog_in_status(read_data=True)
                         if status == 2: # DwfStateDone: Buffer collection completed
-                            scope_voltages = self.ads.analog_in_read_data(channel=0, buffer_size=scope_buffer_samples)
+                            scope_voltages = self.ads.analog_in_get_data(channel=0, n_samples=scope_buffer_samples)
                             break
                         if time.time() > timeout_limit:
                             print("[Pulse Engine Scope Timeout] Exceeded data collection window.")
