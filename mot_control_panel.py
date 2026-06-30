@@ -512,6 +512,7 @@ class CoreInstrumentApplication(tk.Tk):
             
         state_bit = 1 if self.var_magnet_state.get() else 0
         try:
+            self.ads.digital_io_set_output(0x00FF)
             self.ads.digital_io_write_pin(pin=0, value=state_bit)
         except Exception as e:
             print(f"[Error] Failed static register write manipulation: {e}")
