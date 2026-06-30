@@ -120,8 +120,21 @@ class CoreInstrumentApplication(tk.Tk):
             # this app uses -- so without this explicit call there is no
             # guarantee the master output stage is actually enabled.
             self.ads._dwf.FDwfDeviceEnableSet(self.ads._hdwf, 1)
-            # Initialize DIO 0,1,2 as outputs explicitly if required by platform
-            self.ads.digital_io_set_output_enable(0x07)
+            # IMPORTANT: Digital I/O (static) and Digital Out (pattern
+            # generator) are separate ADS sub-systems that share the same
+            # physical DIO header. Whichever instrument claims a pin's
+            # output-enable wins control of it; the Digital Out engine can
+            # successfully program and run a pulse on a pin while reporting
+            # Done, and still produce zero volts on the header if the
+            # Digital I/O instrument also has that pin's output-enable bit
+            # set (it will just keep driving its own static level).
+            #
+            # DIO 0 is the magnet coil and is controlled via static
+            # digital_io_write_pin() -- it stays claimed by Digital I/O.
+            # DIO 1 (shutter) and DIO 2 (camera sync) are driven exclusively
+            # by the Digital Out pattern generator during a pulse sequence,
+            # so they must NOT be claimed here.
+            self.ads.digital_io_set_output_enable(0x01)
         except Exception as e:
             print(f"[Warning] Analog Discovery device could not connect: {e}")
             self.ads = None
@@ -607,10 +620,13 @@ class CoreInstrumentApplication(tk.Tk):
 
         def _write():
             try:
-                # Ensure DIO 0-2 are still configured as outputs (a previous
-                # digital_out_reset() or digital_io_reset() call inside the
-                # pulse sequence can clear the output-enable mask).
-                self.ads.digital_io_set_output_enable(0x07)
+                # Ensure DIO 0 is still configured as an output (a previous
+                # digital_io_reset() call could clear the output-enable mask).
+                # Only claim pin 0 here -- pins 1 and 2 belong to the Digital
+                # Out pattern generator and must stay unclaimed by Digital
+                # I/O, or the pattern generator's pulses get silently
+                # overridden by Digital I/O's static (low) drive on those pins.
+                self.ads.digital_io_set_output_enable(0x01)
                 self.ads.digital_io_write_pin(pin=0, value=state_bit)
                 print(f"[Magnet] DIO 0 set {'HIGH (on)' if state_bit else 'LOW (off)'}")
             except Exception as e:
@@ -913,6 +929,16 @@ class CoreInstrumentApplication(tk.Tk):
                         pulse_pins.insert(0, 0)
                         pulse_highs.insert(0, pd3_domain_s)
                         pulse_lows.insert(0, between_s)
+                        # Digital I/O normally owns pin 0 (the magnet's static
+                        # level). Release its claim so the Digital Out pattern
+                        # generator can actually drive it during the pulse --
+                        # otherwise Digital I/O's static low/high level wins
+                        # and the pulse on pin 0 is invisible, same as the
+                        # pin 1/2 issue.
+                        try:
+                            self.ads.digital_io_set_output_enable(0x00)
+                        except Exception as _e:
+                            print(f"[Pulse Engine] Could not release DIO0 from Digital I/O: {_e}")
 
                     total_run_s   = (pd3_domain_s + between_s) * total_pulses
                     pulse_timeout = total_run_s + 2.0  # safety margin
@@ -990,12 +1016,13 @@ class CoreInstrumentApplication(tk.Tk):
                 if pulse_error[0]:
                     print(f"[Pulse Engine] Pulse error: {pulse_error[0]}")
 
-                # After Digital Out finishes, restore DIO 0 (magnet) to
-                # whatever the checkbox says -- the pulse temporarily overrides
-                # the static Digital I/O level on that pin.
+                # After Digital Out finishes, hand DIO 0 (magnet) back to
+                # Digital I/O and restore its static level -- the pulse
+                # temporarily took ownership of that pin away from Digital
+                # I/O so it could toggle during the sync burst.
                 if self.ads and self.var_sync_pulse.get():
                     try:
-                        self.ads.digital_io_set_output_enable(0x07)
+                        self.ads.digital_io_set_output_enable(0x01)
                         self.ads.digital_io_write_pin(
                             pin=0, value=bool(self.var_magnet_state.get())
                         )
