@@ -15,7 +15,7 @@ from waveforms_ads import (
     WaveFormsADS,
     DwfDigitalOutIdleLow, DwfDigitalOutIdleHigh,
     DwfStateDone,
-    trigsrcDetectorDigitalIn,
+    trigsrcDigitalOut,
 )
 from allied_vision_camera import AlliedVisionCamera, CameraConfig, HardwareTriggerConfig, TriggerActivation, TriggerSelector, AcquisitionMode
 
@@ -980,7 +980,7 @@ class CoreInstrumentApplication(tk.Tk):
                     self.ads.analog_in_set_sample_rate(scope_sample_rate)
                     self.ads.analog_in_set_buffer_size(scope_buffer_samples)
                     # Trigger on the rising edge of the Digital Out bus
-                    self.ads.analog_in_set_trigger_source(trigsrcDetectorDigitalIn)
+                    self.ads.analog_in_set_trigger_source(trigsrcDigitalOut)
                     self.ads.analog_in_set_trigger_type(0)       # edge
                     self.ads.analog_in_set_trigger_condition(0)  # rising
                     self.ads.analog_in_set_trigger_position(0.5*scope_buffer_samples/scope_sample_rate) # put trigger at start of buffer
@@ -1031,7 +1031,7 @@ class CoreInstrumentApplication(tk.Tk):
                             break
                         if time.time() > timeout_limit:
                             print("[Pulse Engine Scope Timeout] Exceeded data collection window.")
-                            print(f"Scope status: {status}")
+                            print(f"Scope status: {status}") #debug line - currently armed not trig'd
                             break
                         time.sleep(0.01)
 

@@ -95,6 +95,7 @@ trigsrcDetectorAnalogIn  = 2
 trigsrcDetectorDigitalIn = 3
 trigsrcAnalogIn          = 4
 trigsrcDigitalIn         = 5
+trigsrcDigitalOut        = 6
 trigsrcExternal1         = 11
 
 # Trigger types
