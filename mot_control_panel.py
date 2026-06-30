@@ -1031,6 +1031,7 @@ class CoreInstrumentApplication(tk.Tk):
                             break
                         if time.time() > timeout_limit:
                             print("[Pulse Engine Scope Timeout] Exceeded data collection window.")
+                            print(f"Scope status: {status}")
                             break
                         time.sleep(0.01)
 
