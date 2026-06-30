@@ -113,6 +113,13 @@ class CoreInstrumentApplication(tk.Tk):
         """Secure safe handles to the hardware layers."""
         try:
             self.ads = WaveFormsADS()
+            # FDwfDeviceEnableSet(1) is the master gate for ALL device
+            # outputs (both Digital I/O static writes and the Digital Out
+            # pattern generator). The waveforms_ads wrapper only flips this
+            # via its outputs_enabled() context manager, which nothing in
+            # this app uses -- so without this explicit call there is no
+            # guarantee the master output stage is actually enabled.
+            self.ads._dwf.FDwfDeviceEnableSet(self.ads._hdwf, 1)
             # Initialize DIO 0,1,2 as outputs explicitly if required by platform
             self.ads.digital_io_set_output_enable(0x07)
         except Exception as e:
@@ -918,32 +925,85 @@ class CoreInstrumentApplication(tk.Tk):
                           f"high={pd3_domain_s*1000:.1f}ms low={between_s*1000:.0f}ms "
                           f"x{total_pulses} (run={total_run_s:.3f}s)")
 
-                    # Pre-program the generator (resets it internally); do NOT
-                    # start it yet -- we pass wait_for_done=False and fire via
-                    # digital_out_configure() after the scope is armed.
-                    self.ads.digital_out_pulse_train(
-                        pins=pulse_pins,
-                        high_times_s=pulse_highs,
-                        low_times_s=pulse_lows,
-                        idle_states=DwfDigitalOutIdleLow,
-                        pulse_count=total_pulses,
-                        wait_for_done=False,
-                    )
+                    # Program each channel manually (mirrors what
+                    # digital_out_pulse_train() does internally) so we can
+                    # control the exact call order and force the trigger
+                    # source to "none" (immediate) right before configure().
+                    #
+                    # WHY NOT JUST CALL digital_out_pulse_train()?
+                    # That helper calls digital_out_reset() first, then
+                    # programs each channel, then calls
+                    # digital_out_configure(start=True) at the very end --
+                    # but it never explicitly sets the trigger source. If a
+                    # previous session (or another instrument on this device)
+                    # left TriggerSource pointing at something other than
+                    # trigsrcNone, configure(start=True) puts the generator
+                    # into Armed/Wait state waiting for a trigger edge that
+                    # never arrives. No exception is raised -- the pins
+                    # simply never move, and digital_out_status() sits at
+                    # Armed/Wait until our host-side timeout silently expires.
+                    # That exactly matches the symptom reported ("no errors,
+                    # pins not moving").
+                    self.ads.digital_out_reset()
 
-                    # digital_out_pulse_train with wait_for_done=False still
-                    # calls digital_out_configure(start=True) at the end, so
-                    # the generator is already running.  Spawn a watcher thread
-                    # that polls for Done and sets the event when finished.
+                    clk = self.ads.digital_out_get_internal_clock()
+                    MIN_TICKS, MAX_COUNT = 1, 0xFFFF_FFFF
+
+                    for pin, ht, lt in zip(pulse_pins, pulse_highs, pulse_lows):
+                        total_high = max(MIN_TICKS, round(clk * ht))
+                        total_low  = max(MIN_TICKS, round(clk * lt))
+                        divider = 1
+                        while (total_high // divider > MAX_COUNT or
+                               total_low  // divider > MAX_COUNT):
+                            divider += 1
+                        high_ticks = max(1, round(total_high / divider))
+                        low_ticks  = max(1, round(total_low  / divider))
+
+                        self.ads.digital_out_enable_channel(pin, True)
+                        self.ads.digital_out_set_output_mode(pin, 0)  # push-pull
+                        self.ads.digital_out_set_type(pin, 0)         # pulse
+                        self.ads.digital_out_set_idle(pin, DwfDigitalOutIdleLow)
+                        self.ads.digital_out_set_divider_init(pin, divider)
+                        self.ads.digital_out_set_divider(pin, divider)
+                        self.ads.digital_out_set_counter_init(pin, start_high=True, initial_count=high_ticks)
+                        self.ads.digital_out_set_counter(pin, low_count=low_ticks, high_count=high_ticks)
+
+                    # Global timing
+                    self.ads.digital_out_set_wait_time(0.0)
+                    self.ads.digital_out_set_run_time(total_run_s)
+                    self.ads.digital_out_set_repeat(1)
+                    try:
+                        self.ads.digital_out_set_repeat_trigger(False)
+                    except Exception:
+                        pass  # not all firmware revisions expose this
+
+                    # Force immediate (untriggered) start -- see note above.
+                    self.ads.digital_out_set_trigger_source(0)  # trigsrcNone
+
+                    self.ads.digital_out_configure(start=True)
+                    print(f"[Pulse Engine] digital_out_configure(start=True) issued; "
+                          f"status={self.ads.digital_out_status()}")
+
+                    # Watcher thread: poll for Done state without blocking the
+                    # rest of the sequence (scope/camera run concurrently).
                     def _wait_pulse_done():
                         try:
                             deadline = time.time() + pulse_timeout
+                            last_status = None
                             while True:
-                                if self.ads.digital_out_status() == DwfStateDone:
+                                status = self.ads.digital_out_status()
+                                if status != last_status:
+                                    print(f"[Pulse Engine] digital_out status -> {status}")
+                                    last_status = status
+                                if status == DwfStateDone:
                                     print("[Pulse Engine] digital_out Done.")
                                     break
                                 if time.time() > deadline:
                                     pulse_error[0] = TimeoutError(
-                                        f"Pulse did not finish within {pulse_timeout:.1f}s"
+                                        f"Pulse did not finish within {pulse_timeout:.1f}s "
+                                        f"(stuck in status={status} -- if this is 1 (Armed) or "
+                                        f"7 (Wait), the generator is waiting on a trigger that "
+                                        f"never arrived)"
                                     )
                                     break
                                 time.sleep(0.005)
