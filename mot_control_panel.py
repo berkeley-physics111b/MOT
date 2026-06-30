@@ -177,22 +177,22 @@ class CoreInstrumentApplication(tk.Tk):
         self.rowconfigure(1, weight=1)
 
         # 1. Top Left: Pulse Configuration and Waveform Preview
-        self.p_top_left = ttk.LabelFrame(self, text="Top Left: Pulse Control Sequence Settings")
+        self.p_top_left = ttk.LabelFrame(self, text="Pulse Control Sequence Settings")
         self.p_top_left.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         self.build_top_left_panel()
 
         # 2. Top Right: Live Camera Matrix Control & Parameters
-        self.p_top_right = ttk.LabelFrame(self, text="Top Right: Camera Interface & Live Video")
+        self.p_top_right = ttk.LabelFrame(self, text="Camera Interface & Live Video")
         self.p_top_right.grid(row=0, column=1, sticky="nsew", padx=6, pady=6)
         self.build_top_right_panel()
 
         # 3. Bottom Left: Oscilloscope Trace (Fluorescence PD3) & Magnet IO Switches
-        self.p_bottom_left = ttk.LabelFrame(self, text="Bottom Left: Fluorescence (PD3) Scope & Magnet Control")
+        self.p_bottom_left = ttk.LabelFrame(self, text="Fluorescence (PD3) Scope & Magnet Control")
         self.p_bottom_left.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
         self.build_bottom_left_panel()
 
         # 4. Bottom Right: Signal Processing Matrix (Snapshot Subtraction Array)
-        self.p_bottom_right = ttk.LabelFrame(self, text="Bottom Right: Data Extraction & Background Profiles")
+        self.p_bottom_right = ttk.LabelFrame(self, text="Data Extraction & Background Profiles")
         self.p_bottom_right.grid(row=1, column=1, sticky="nsew", padx=6, pady=6)
         self.build_bottom_right_panel()
 
@@ -694,10 +694,6 @@ class CoreInstrumentApplication(tk.Tk):
             self.latest_live_frame = frame.copy()
             self.after(0, self._update_live_canvas, frame)
         except Exception as e:
-            # The old polling loop wrapped this whole path in a bare
-            # `except Exception: pass`, so failures like this (e.g. the
-            # channel-shape bug below) fired on every frame and never
-            # produced a single line of console output.
             print(f"[Live View] Frame processing error: {e}")
 
     def _update_live_canvas(self, raw_frame):
@@ -732,10 +728,7 @@ class CoreInstrumentApplication(tk.Tk):
         self._live_tk_image_holder = tk_img  # Maintain pointer memory reference to prevent sudden garbage collection drops
 
         # Reuse a single canvas image item via itemconfig() instead of
-        # calling create_image() on every frame. The original version
-        # created a brand-new image item ~30 times/second without ever
-        # deleting the previous one, silently accumulating thousands of
-        # canvas items per session until the UI bogged down.
+        # calling create_image() on every frame.
         if self._live_canvas_image_id is None:
             self._live_canvas_image_id = self.camera_canvas.create_image(0, 0, anchor="nw", image=tk_img)
         else:
@@ -905,13 +898,6 @@ class CoreInstrumentApplication(tk.Tk):
 
                 # 2. Program and fire the Digital Out pattern generator.
                 #
-                # digital_out_pulse_train() has been updated to no longer call
-                # the (unsupported-on-this-device) digital_out_set_repetition;
-                # it now relies purely on run_time + the per-channel
-                # divider/counter programming, which is the standard DWF
-                # approach. We call it directly with wait_for_done=True on a
-                # background thread so the main GUI doesn't block.
-                #
                 # Pin roles:
                 #   DIO 0 – magnet coil  (only when "Synchronize" checkbox is on)
                 #   DIO 1 – shutter
@@ -997,6 +983,7 @@ class CoreInstrumentApplication(tk.Tk):
                     self.ads.analog_in_set_trigger_source(trigsrcDetectorDigitalIn)
                     self.ads.analog_in_set_trigger_type(0)       # edge
                     self.ads.analog_in_set_trigger_condition(0)  # rising
+                    self.ads.analog_in_set_trigger_position(0.5*scope_buffer_samples/scope_sample_rate) # put trigger at start of buffer
                     self.ads.analog_in_configure(reconfigure=True, start=True)
                     print(f"[Pulse Engine] Oscilloscope armed: {scope_buffer_samples} "
                           f"samples @ {scope_sample_rate/1e3:.0f} kHz")
