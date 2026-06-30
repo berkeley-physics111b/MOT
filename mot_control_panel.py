@@ -995,6 +995,7 @@ class CoreInstrumentApplication(tk.Tk):
                         # TODO: switch to hardware trigger when wiring is confirmed
                         # 'software trigger' not possible with old guppy (?) so removed
                         # need to re-examine that function in allied_vision_camera.py
+                        # trigger on falling edge so don't need different delays for pulses?
                         self.execute_immediate_snapshot()
                         captured_frame = self.latest_live_frame()
                     except Exception as err:

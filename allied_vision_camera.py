@@ -176,6 +176,10 @@ class HardwareTriggerConfig:
         The camera GPIO input line name, e.g. ``"Line1"``, ``"Line2"``.
         Inspect your camera with Vimba X Viewer or call
         ``cam.list_hardware_trigger_lines()`` to see valid values.
+    source:
+        The trigger source, e.g. "Input Lines". Inspect camera with
+        Vimba X Viewer or call ``cam.list_hardware_trigger_sources()``
+        to see valid values.
     activation:
         Signal edge or level that fires the trigger.
     selector:
@@ -197,6 +201,7 @@ class HardwareTriggerConfig:
         Default wait timeout for ``wait_for_hardware_trigger()``.
     """
     line: str = "Line1"
+    source: str = "InputLines"
     activation: TriggerActivation = TriggerActivation.RISING_EDGE
     selector: TriggerSelector = TriggerSelector.FRAME_START
     acquisition_mode: AcquisitionMode = AcquisitionMode.SINGLE_FRAME
@@ -675,6 +680,18 @@ class AlliedVisionCamera:
         except Exception as exc:  # noqa: BLE001
             _log.warning("Could not enumerate GPIO lines: %s", exc)
             return []
+    
+    def list_hardware_trigger_sources(self) -> list[str]:
+        """
+        Return trigger source types.
+        Example output: ``['InputLines']``
+        """
+        cam = self._cam
+        try:
+            return list(cam.TriggerSource.get_all_entries())
+        except Exception as exc:
+            _log.warning("Could not enumerate trigger sources: %s", exc)
+            return []
 
     def arm_hardware_trigger(
         self,
@@ -754,7 +771,7 @@ class AlliedVisionCamera:
         # --- Trigger selector and source ---
         try:
             cam.TriggerSelector.set(hw_config.selector.value)
-            cam.TriggerSource.set(hw_config.line)
+            cam.TriggerSource.set(hw_config.source)
             cam.TriggerActivation.set(hw_config.activation.value)
             cam.TriggerMode.set("On")
             _log.debug(
