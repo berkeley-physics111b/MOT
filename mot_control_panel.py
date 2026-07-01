@@ -159,6 +159,12 @@ class CoreInstrumentApplication(tk.Tk):
                 print(f"[Camera] GPIO trigger lines reported by this camera: {self.available_trigger_lines}")
             except Exception as e:
                 print(f"[Camera] Could not enumerate GPIO trigger lines: {e}")
+            
+            try:
+                self.available_trigger_sources = list(self.camera.list_hardware_trigger_sources())
+                print(f"[Camera] Trigger sources reported by this camera: {self.available_trigger_sources}")
+            except Exception as e:
+                print(f"[Camera] Could not enumerate trigger sources: {e}")
 
             try:
                 self.available_trigger_selectors = [str(entry) for entry in self.camera._cam.TriggerSelector.get_all_entries()]
@@ -428,15 +434,17 @@ class CoreInstrumentApplication(tk.Tk):
         # Hardware Trigger Wiring -- populated from whatever GPIO lines and
         # trigger selectors THIS connected camera actually reports
         # (queried in init_hardware_connections). Different camera models
-        # use different names here ("Line1" / "FrameStart" are common
+        # use different names here ("Line0" / "FrameStart" are common
         # defaults but not universal), so hardcoding them caused
         # "no enum entry" errors on cameras that don't expose those exact
         # names. Falling back to a placeholder list keeps the GUI usable
         # even if no camera is connected yet.
-        line_options = self.available_trigger_lines or ["Line1"]
+        line_options = self.available_trigger_lines or ["Line0"]
+        source_options = self.available_trigger_sources or ["InputLines"]
         selector_options = self.available_trigger_selectors or ["FrameStart"]
 
         self.var_trigger_line = tk.StringVar(value=line_options[0])
+        self.var_trigger_source = tk.StringVar(value=source_options[0])
         self.var_trigger_selector = tk.StringVar(value=selector_options[0])
 
         trig_box = ttk.LabelFrame(controls_frame, text="Hardware Trigger Wiring")
@@ -444,11 +452,14 @@ class CoreInstrumentApplication(tk.Tk):
 
         ttk.Label(trig_box, text="GPIO Line:").grid(row=0, column=0, **grid_params)
         ttk.Combobox(trig_box, textvariable=self.var_trigger_line, values=line_options, width=14, state="readonly").grid(row=0, column=1, sticky="w")
+        
+        ttk.Label(trig_box, text="Trigger Source:").grid(row=1, column=0, **grid_params)
+        ttk.Combobox(trig_box, textvariable=self.var_trigger_source, values=source_options, width=14, state="readonly").grid(row=1, column=1, sticky="w")
 
-        ttk.Label(trig_box, text="Trigger Selector:").grid(row=1, column=0, **grid_params)
-        ttk.Combobox(trig_box, textvariable=self.var_trigger_selector, values=selector_options, width=14, state="readonly").grid(row=1, column=1, sticky="w")
+        ttk.Label(trig_box, text="Trigger Selector:").grid(row=2, column=0, **grid_params)
+        ttk.Combobox(trig_box, textvariable=self.var_trigger_selector, values=selector_options, width=14, state="readonly").grid(row=2, column=1, sticky="w")
 
-        if not self.available_trigger_lines or not self.available_trigger_selectors:
+        if not self.available_trigger_lines or not self.available_trigger_selectors or not self.available_trigger_sources:
             ttk.Label(trig_box, text="(No camera connected -- placeholder values shown)", foreground="#cc8800").grid(row=2, column=0, columnspan=2, sticky="w", padx=2)
 
         # Operational Control Buttons Pack
@@ -998,6 +1009,7 @@ class CoreInstrumentApplication(tk.Tk):
                         try:
                             hw_cfg = HardwareTriggerConfig(
                                 line=self.var_trigger_line.get(),
+                                source=self.var_trigger_source.get(),
                                 selector=self._resolve_trigger_selector(),
                                 activation=TriggerActivation.FALLING_EDGE,
                                 acquisition_mode=AcquisitionMode.SINGLE_FRAME,

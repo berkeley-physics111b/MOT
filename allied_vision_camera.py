@@ -200,10 +200,10 @@ class HardwareTriggerConfig:
     timeout_s:
         Default wait timeout for ``wait_for_hardware_trigger()``.
     """
-    line: str = "Line1"
+    line: str = "Line0"
     source: str = "InputLines"
     activation: TriggerActivation = TriggerActivation.RISING_EDGE
-    selector: TriggerSelector = TriggerSelector.FRAME_START
+    selector: TriggerSelector = TriggerSelector.ACQUISITION_START
     acquisition_mode: AcquisitionMode = AcquisitionMode.SINGLE_FRAME
     frame_count: int = 1
     trigger_delay_us: Optional[float] = None
