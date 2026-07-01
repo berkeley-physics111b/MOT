@@ -109,7 +109,97 @@ class CoreInstrumentApplication(tk.Tk):
         # Start Live View Processing Loop
         self.start_live_view()
 
-    def init_hardware_connections(self):
+        # Intercept the window manager's close button ("X") -- by default
+        # Tk's WM_DELETE_WINDOW just destroys the window without giving the
+        # application a chance to run any cleanup, so the camera stream and
+        # ADS (WaveForms) device handles were previously left open,
+        # sometimes forcing a hardware unplug/replug before the next run
+        # would connect cleanly. Route the close button through an explicit
+        # shutdown routine instead.
+        self.protocol("WM_DELETE_WINDOW", self.on_app_close)
+
+    def on_app_close(self):
+        """
+        Cleanly release all hardware handles before the window closes.
+
+        Order matters here: streaming/acquisition must be stopped before a
+        device is closed, and the camera's live-view thread must be told to
+        stop pushing frames onto the Tk main loop (via self.after) before
+        the window is torn down, or a queued callback can fire against
+        widgets that no longer exist.
+        """
+        print("[Shutdown] Close requested -- releasing hardware handles...")
+
+        # Stop the live-view callback path first so no further frames get
+        # scheduled onto this (soon to be destroyed) Tk main loop.
+        self.live_view_active = False
+
+        # --- Camera ---
+        if self.camera is not None:
+            try:
+                self._stop_camera_live_view()
+            except Exception as e:
+                print(f"[Shutdown] Error stopping camera live view: {e}")
+            try:
+                self.camera.close()
+                print("[Shutdown] Camera connection closed.")
+            except Exception as e:
+                print(f"[Shutdown] Error closing camera: {e}")
+            finally:
+                self.camera = None
+
+        # --- Analog Discovery / WaveForms device ---
+        if self.ads is not None:
+            try:
+                # Leave the digital outputs in a known-safe (all-low) state
+                # before tearing down the device handle, rather than
+                # abandoning them mid-pulse if a sequence happened to be
+                # interrupted.
+                try:
+                    self.ads.digital_io_set_output_enable(0x01)
+                    self.ads.digital_io_write_pin(pin=0, value=False)
+                except Exception:
+                    pass
+                try:
+                    self.ads.analog_in_reset()
+                except Exception:
+                    pass
+
+                # The waveforms_ads wrapper doesn't expose a documented
+                # high-level close()/dispose() in this codebase (every
+                # other call site in this file reaches directly into
+                # self.ads._dwf / self.ads._hdwf for low-level operations
+                # that aren't wrapped), so prefer a close()-style method if
+                # one exists, and fall back to calling the underlying
+                # FDwfDeviceClose() directly so the device handle is
+                # actually released and the AD board shows back up as
+                # available the next time this app is started.
+                closed = False
+                for close_method_name in ("close", "dispose", "shutdown"):
+                    close_method = getattr(self.ads, close_method_name, None)
+                    if callable(close_method):
+                        close_method()
+                        closed = True
+                        break
+                if not closed and hasattr(self.ads, "_dwf") and hasattr(self.ads, "_hdwf"):
+                    self.ads._dwf.FDwfDeviceClose(self.ads._hdwf)
+                    closed = True
+                print(f"[Shutdown] Analog Discovery device {'closed' if closed else 'left as-is (no close hook found)'}.")
+            except Exception as e:
+                print(f"[Shutdown] Error closing Analog Discovery device: {e}")
+            finally:
+                self.ads = None
+
+        # Tear down the Tk event loop and window.
+        try:
+            self.quit()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        print("[Shutdown] Application closed.")
         """Secure safe handles to the hardware layers."""
         try:
             self.ads = WaveFormsADS()
@@ -266,7 +356,7 @@ class CoreInstrumentApplication(tk.Tk):
 
         # Visual Plot Canvas for Matrix Preview Strategy
         ttk.Label(container, text="Intended Signal Trajectory Preview:").grid(row=5, column=0, columnspan=2, sticky="w", pady=(8,2))
-        self.sequence_canvas = tk.Canvas(container, height=140, bg="#1e1e1e", highlightthickness=0)
+        self.sequence_canvas = tk.Canvas(container, height=175, bg="#1e1e1e", highlightthickness=0)
         self.sequence_canvas.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=4)
         container.rowconfigure(6, weight=1)
         container.columnconfigure(1, weight=1)
@@ -311,7 +401,7 @@ class CoreInstrumentApplication(tk.Tk):
         """Draws a multi-channel timing schematic with a real time axis and repeated pulses."""
         self.sequence_canvas.delete("all")
         w = self.sequence_canvas.winfo_width() if self.sequence_canvas.winfo_width() > 50 else 500
-        h = self.sequence_canvas.winfo_height() if self.sequence_canvas.winfo_height() > 50 else 140
+        h = self.sequence_canvas.winfo_height() if self.sequence_canvas.winfo_height() > 50 else 175
 
         try:
             snap_delay_ms   = self.var_time_after_pulse.get()
@@ -338,11 +428,15 @@ class CoreInstrumentApplication(tk.Tk):
         # right-most time-axis tick label (e.g. "1000ms") without it being
         # clipped by the edge of the canvas -- with anchor="n" the label is
         # centered on its tick, so roughly half its width extends to the
-        # right of the last tick mark.
+        # right of the last tick mark. TOP_MARGIN leaves headroom above the
+        # plot for the "PD3" region label, and AXIS_HEIGHT leaves enough
+        # room below the plot for the time-axis tick marks and their text
+        # labels -- both were previously tall enough to get clipped by the
+        # canvas edge.
         LEFT_MARGIN  = 72   # px for channel labels
         RIGHT_MARGIN = 40
-        TOP_MARGIN   = 8
-        AXIS_HEIGHT  = 18   # px for the time axis at the bottom
+        TOP_MARGIN   = 22
+        AXIS_HEIGHT  = 26   # px for the time axis at the bottom
         plot_w = w - LEFT_MARGIN - RIGHT_MARGIN
         plot_h = h - TOP_MARGIN - AXIS_HEIGHT
         if plot_w <= 0 or plot_h <= 0:
