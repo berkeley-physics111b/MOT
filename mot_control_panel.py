@@ -200,6 +200,8 @@ class CoreInstrumentApplication(tk.Tk):
         except Exception:
             pass
         print("[Shutdown] Application closed.")
+
+    def init_hardware_connections(self):
         """Secure safe handles to the hardware layers."""
         try:
             self.ads = WaveFormsADS()
