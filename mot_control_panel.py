@@ -177,30 +177,53 @@ class CoreInstrumentApplication(tk.Tk):
             self.camera = None
 
     def create_four_panels(self):
-        """Construct a clean 2x2 responsive grid allocation layout."""
-        self.columnconfigure(0, weight=1)
-        self.columnconfigure(1, weight=1)
-        self.rowconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        """
+        Construct a resizable 2x2 layout using nested PanedWindows.
 
-        # 1. Top Left: Pulse Configuration and Waveform Preview
-        self.p_top_left = ttk.LabelFrame(self, text="Pulse Control Sequence Settings")
-        self.p_top_left.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        Using a horizontal PanedWindow per row (rather than a single shared
+        grid) lets the two panels in the top row be sized independently
+        from the two panels in the bottom row -- e.g. the top-left panel
+        can be narrower than the top-right panel, while on the bottom row
+        the right panel can be wider than the left one. A single 2x2
+        columnconfigure/rowconfigure grid forces both rows to share the
+        same column widths, which made it impossible to size any one
+        panel independently of the panel directly above/below it. The
+        outer vertical PanedWindow also lets the whole top row be shrunk
+        relative to the bottom row, and every sash remains user-draggable.
+        """
+        self.main_vertical_pane = ttk.PanedWindow(self, orient="vertical")
+        self.main_vertical_pane.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.top_row_pane = ttk.PanedWindow(self.main_vertical_pane, orient="horizontal")
+        self.bottom_row_pane = ttk.PanedWindow(self.main_vertical_pane, orient="horizontal")
+
+        # Top row is given less relative height than the bottom row, so
+        # both top panels are a little smaller and the bottom row (scope +
+        # data extraction controls) gets the extra room it needs.
+        self.main_vertical_pane.add(self.top_row_pane, weight=2)
+        self.main_vertical_pane.add(self.bottom_row_pane, weight=3)
+
+        # 1. Top Left: Pulse Configuration and Waveform Preview (kept
+        # narrower than the top-right camera view -- weight=2 vs weight=3)
+        self.p_top_left = ttk.LabelFrame(self.top_row_pane, text="Pulse Control Sequence Settings")
+        self.top_row_pane.add(self.p_top_left, weight=2)
         self.build_top_left_panel()
 
         # 2. Top Right: Live Camera Matrix Control & Parameters
-        self.p_top_right = ttk.LabelFrame(self, text="Camera Interface & Live Video")
-        self.p_top_right.grid(row=0, column=1, sticky="nsew", padx=6, pady=6)
+        self.p_top_right = ttk.LabelFrame(self.top_row_pane, text="Camera Interface & Live Video")
+        self.top_row_pane.add(self.p_top_right, weight=3)
         self.build_top_right_panel()
 
         # 3. Bottom Left: Oscilloscope Trace (Fluorescence PD3) & Magnet IO Switches
-        self.p_bottom_left = ttk.LabelFrame(self, text="Fluorescence (PD3) Scope & Magnet Control")
-        self.p_bottom_left.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+        self.p_bottom_left = ttk.LabelFrame(self.bottom_row_pane, text="Fluorescence (PD3) Scope & Magnet Control")
+        self.bottom_row_pane.add(self.p_bottom_left, weight=2)
         self.build_bottom_left_panel()
 
-        # 4. Bottom Right: Signal Processing Matrix (Snapshot Subtraction Array)
-        self.p_bottom_right = ttk.LabelFrame(self, text="Data Extraction & Background Profiles")
-        self.p_bottom_right.grid(row=1, column=1, sticky="nsew", padx=6, pady=6)
+        # 4. Bottom Right: Signal Processing Matrix (Snapshot Subtraction
+        # Array). Given more relative width (weight=3) than bottom-left so
+        # its row of buttons/entries has room to lay out without clipping.
+        self.p_bottom_right = ttk.LabelFrame(self.bottom_row_pane, text="Data Extraction & Background Profiles")
+        self.bottom_row_pane.add(self.p_bottom_right, weight=3)
         self.build_bottom_right_panel()
 
     # =========================================================================
@@ -209,7 +232,7 @@ class CoreInstrumentApplication(tk.Tk):
 
     def build_top_left_panel(self):
         """User parameter dashboard specifying sequencing configurations."""
-        container = ttk.Frame(self.p_top_left, padding=8)
+        container = ttk.Frame(self.p_top_left, padding=6)
         container.pack(fill="both", expand=True)
 
         # Config Variables
@@ -217,42 +240,78 @@ class CoreInstrumentApplication(tk.Tk):
         self.var_time_between_pulses = tk.DoubleVar(value=1.0) # s
         self.var_pd3_window = tk.DoubleVar(value=50.0)       # ms
         self.var_num_pulses = tk.IntVar(value=1)
-        self.var_step_length = tk.DoubleVar(value=1.0)       # ms
 
         # Form Controls layout grid
-        lbl_style = {"sticky": "w", "padx": 4, "pady": 2}
+        lbl_style = {"sticky": "w", "padx": 4, "pady": 1}
         ttk.Label(container, text="Time after pulse to snap (ms):").grid(row=0, column=0, **lbl_style)
-        ttk.Entry(container, textvariable=self.var_time_after_pulse, width=10).grid(row=0, column=1, sticky="w")
+        ttk.Entry(container, textvariable=self.var_time_after_pulse, width=9).grid(row=0, column=1, sticky="w")
 
         ttk.Label(container, text="Time between repeat pulses (s):").grid(row=1, column=0, **lbl_style)
-        ttk.Entry(container, textvariable=self.var_time_between_pulses, width=10).grid(row=1, column=1, sticky="w")
+        ttk.Entry(container, textvariable=self.var_time_between_pulses, width=9).grid(row=1, column=1, sticky="w")
 
         ttk.Label(container, text="Fluorescence PD3 Domain (ms):").grid(row=2, column=0, **lbl_style)
-        ttk.Entry(container, textvariable=self.var_pd3_window, width=10).grid(row=2, column=1, sticky="w")
+        ttk.Entry(container, textvariable=self.var_pd3_window, width=9).grid(row=2, column=1, sticky="w")
 
         ttk.Label(container, text="Number of Pulses:").grid(row=3, column=0, **lbl_style)
-        ttk.Entry(container, textvariable=self.var_num_pulses, width=10).grid(row=3, column=1, sticky="w")
+        ttk.Entry(container, textvariable=self.var_num_pulses, width=9).grid(row=3, column=1, sticky="w")
 
-        ttk.Label(container, text="Step Length Resolution (ms):").grid(row=4, column=0, **lbl_style)
-        ttk.Entry(container, textvariable=self.var_step_length, width=10).grid(row=4, column=1, sticky="w")
+        # Synchronize-magnet checkbox lives next to the pulse parameters now
+        # (moved here from the bottom-left Magnet Control panel) since it
+        # directly governs how this sequence preview and the pulse train
+        # itself treat the magnet (DIO 0) channel.
+        self.var_sync_pulse = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            container, text="Synchronize Magnet Line with Pulse Sequence", variable=self.var_sync_pulse
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 1))
 
         # Visual Plot Canvas for Matrix Preview Strategy
-        ttk.Label(container, text="Intended Signal Trajectory Preview:").grid(row=5, column=0, columnspan=2, sticky="w", pady=(10,2))
+        ttk.Label(container, text="Intended Signal Trajectory Preview:").grid(row=5, column=0, columnspan=2, sticky="w", pady=(8,2))
         self.sequence_canvas = tk.Canvas(container, height=140, bg="#1e1e1e", highlightthickness=0)
         self.sequence_canvas.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=4)
-        
+        container.rowconfigure(6, weight=1)
+        container.columnconfigure(1, weight=1)
+        # Re-draw the preview whenever the canvas is resized, so the time
+        # axis and its labels are never clipped at the current width.
+        self.sequence_canvas.bind("<Configure>", lambda evt: self.render_sequence_preview_graph())
+
+        # Pulse trigger button (moved here from the top-right camera panel,
+        # since firing a pulse is fundamentally a sequence-timing action).
+        self.btn_synch_pulse = tk.Button(
+            container, text="PULSE", bg="#2f2525", fg="white",
+            font=("Arial", 11, "bold"), command=self.execute_synch_pulse_routine
+        )
+        self.btn_synch_pulse.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 6))
+
+        # Auto-save pulse image arrays + base filename (moved here from the
+        # bottom-right Data Extraction panel).
+        self.var_auto_save_pulsed_img = tk.BooleanVar(value=False)
+        self.var_pulse_filename_base = tk.StringVar(value="pulsed_frame_capture")
+
+        autosave_row = ttk.Frame(container)
+        autosave_row.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+        autosave_row.columnconfigure(2, weight=1)
+
+        ttk.Checkbutton(
+            autosave_row, text="Auto-Save Pulse Image Arrays", variable=self.var_auto_save_pulsed_img
+        ).grid(row=0, column=0, padx=(4, 8), sticky="w")
+        ttk.Label(autosave_row, text="Base Filename:").grid(row=0, column=1, sticky="w")
+        ttk.Entry(autosave_row, textvariable=self.var_pulse_filename_base).grid(row=0, column=2, padx=4, sticky="ew")
+
         # Re-draw the visual timing preview trace every time values shift
-        for var in [self.var_time_after_pulse, self.var_time_between_pulses, self.var_pd3_window, self.var_step_length]:
+        for var in [self.var_time_after_pulse, self.var_time_between_pulses, self.var_pd3_window]:
             var.trace_add("write", lambda *args: self.render_sequence_preview_graph())
         self.var_num_pulses.trace_add("write", lambda *args: self.render_sequence_preview_graph())
-        
+        # The magnet channel's rendering depends on whether it's synced to
+        # the pulse train, and (when it isn't) on its current static value.
+        self.var_sync_pulse.trace_add("write", lambda *args: self.render_sequence_preview_graph())
+
         self.render_sequence_preview_graph()
 
     def render_sequence_preview_graph(self):
         """Draws a multi-channel timing schematic with a real time axis and repeated pulses."""
         self.sequence_canvas.delete("all")
         w = self.sequence_canvas.winfo_width() if self.sequence_canvas.winfo_width() > 50 else 500
-        h = 140
+        h = self.sequence_canvas.winfo_height() if self.sequence_canvas.winfo_height() > 50 else 140
 
         try:
             snap_delay_ms   = self.var_time_after_pulse.get()
@@ -262,19 +321,32 @@ class CoreInstrumentApplication(tk.Tk):
         except Exception:
             return  # suppress entry-parsing hiccups during typing
 
+        # Magnet (DIO 0) is only part of the pulse train when the
+        # "Synchronize" checkbox is on; otherwise it just sits at whatever
+        # static level the manual toggle in the Magnet Control panel is
+        # set to, and is rendered as a flat DC line instead of a pulse.
+        sync_magnet   = bool(self.var_sync_pulse.get())
+        magnet_is_high = bool(getattr(self, "var_magnet_state", tk.BooleanVar(value=False)).get())
+
         # Total time window to display (ms)
         between_ms   = between_s * 1000.0
         total_ms     = (pd3_domain_ms + between_ms) * num_pulses
         if total_ms <= 0:
             return
 
-        # Layout constants
-        LEFT_MARGIN  = 70   # px for channel labels
-        RIGHT_MARGIN = 10
+        # Layout constants. RIGHT_MARGIN is generous enough to fit the
+        # right-most time-axis tick label (e.g. "1000ms") without it being
+        # clipped by the edge of the canvas -- with anchor="n" the label is
+        # centered on its tick, so roughly half its width extends to the
+        # right of the last tick mark.
+        LEFT_MARGIN  = 72   # px for channel labels
+        RIGHT_MARGIN = 40
         TOP_MARGIN   = 8
         AXIS_HEIGHT  = 18   # px for the time axis at the bottom
         plot_w = w - LEFT_MARGIN - RIGHT_MARGIN
         plot_h = h - TOP_MARGIN - AXIS_HEIGHT
+        if plot_w <= 0 or plot_h <= 0:
+            return
 
         # Three channels; each gets 1/3 of plot_h
         ch_h     = plot_h // 3
@@ -303,50 +375,75 @@ class CoreInstrumentApplication(tk.Tk):
                 fill="#2a2a2a", dash=(3, 4)
             )
 
+        # Dashed vertical markers showing the PD3 fluorescence measurement
+        # domain/region for every pulse -- i.e. the window from each
+        # pulse's rising edge to pd3_domain_ms later.
+        plot_top = TOP_MARGIN
+        plot_bottom = TOP_MARGIN + plot_h
+        t = 0.0
+        pd3_label_drawn = False
+        for p in range(num_pulses):
+            t_start = t
+            t_end = t + pd3_domain_ms
+            x_start = t2x(t_start)
+            x_end = t2x(min(t_end, total_ms))
+            for x_mark in (x_start, x_end):
+                self.sequence_canvas.create_line(
+                    x_mark, plot_top, x_mark, plot_bottom,
+                    fill="#ff5252", dash=(4, 3), width=1
+                )
+            if not pd3_label_drawn:
+                self.sequence_canvas.create_text(
+                    (x_start + x_end) / 2, plot_top - 2,
+                    text="PD3", fill="#ff5252", font=("Consolas", 7), anchor="s"
+                )
+                pd3_label_drawn = True
+            t = t + pd3_domain_ms + between_ms
+
         # Draw pulses for each channel
         for row, (label, color, pin) in enumerate(channels):
             base_y = row_y(row)
             high_y = base_y - int(ch_h * 0.75)
 
+            # Magnet channel, when not synchronized to the pulse train,
+            # just displays its current static value as a flat line.
+            if pin == 0 and not sync_magnet:
+                level_y = high_y if magnet_is_high else base_y
+                self.sequence_canvas.create_line(
+                    t2x(0), level_y, t2x(total_ms), level_y, fill=color, width=1
+                )
+                state_txt = "STATIC HIGH" if magnet_is_high else "STATIC LOW"
+                self.sequence_canvas.create_text(
+                    t2x(total_ms) - 4, level_y - 6, text=state_txt,
+                    fill=color, font=("Consolas", 7), anchor="e"
+                )
+                continue
+
+            # The camera sync pin shares the SAME rising edge as the magnet
+            # and shutter channels, but its high-time is "time after pulse
+            # to snap" rather than the full PD3 domain -- its falling edge
+            # is what fires the camera's hardware trigger, so the falling
+            # edge lands exactly at the intended snap time.
+            chan_high_ms = snap_delay_ms if pin == 2 else pd3_domain_ms
+
             t = 0.0
-            # Lead-in flat line
             x0 = t2x(0)
             for p in range(num_pulses):
-                # Rising edge
                 x_rise = t2x(t)
-                # High phase
-                t_fall = t + pd3_domain_ms
-                x_fall = t2x(t_fall)
-                # Falling edge, then low until next pulse
+                t_fall = t + chan_high_ms
+                x_fall = t2x(min(t_fall, total_ms))
                 t_next = t + pd3_domain_ms + between_ms
                 x_next = t2x(min(t_next, total_ms))
 
-                # Camera sync pin (DIO 2) fires at snap_delay_ms after pulse start
-                if pin == 2:
-                    t_cam_rise = t + snap_delay_ms
-                    t_cam_fall = t_cam_rise + min(5.0, pd3_domain_ms * 0.1)  # narrow blip
-                    if t_cam_rise < total_ms:
-                        xc0 = t2x(t_cam_rise)
-                        xc1 = t2x(min(t_cam_fall, total_ms))
-                        # flat low before blip
-                        self.sequence_canvas.create_line(x0, base_y, xc0, base_y, fill=color, width=1)
-                        # rising
-                        self.sequence_canvas.create_line(xc0, base_y, xc0, high_y, fill=color, width=1)
-                        # high
-                        self.sequence_canvas.create_line(xc0, high_y, xc1, high_y, fill=color, width=1)
-                        # falling
-                        self.sequence_canvas.create_line(xc1, high_y, xc1, base_y, fill=color, width=1)
-                        x0 = xc1
-                else:
-                    # flat low before rise
-                    self.sequence_canvas.create_line(x0, base_y, x_rise, base_y, fill=color, width=1)
-                    # rising edge
-                    self.sequence_canvas.create_line(x_rise, base_y, x_rise, high_y, fill=color, width=1)
-                    # high phase
-                    self.sequence_canvas.create_line(x_rise, high_y, x_fall, high_y, fill=color, width=1)
-                    # falling edge
-                    self.sequence_canvas.create_line(x_fall, high_y, x_fall, base_y, fill=color, width=1)
-                    x0 = x_fall
+                # flat low before rise
+                self.sequence_canvas.create_line(x0, base_y, x_rise, base_y, fill=color, width=1)
+                # rising edge
+                self.sequence_canvas.create_line(x_rise, base_y, x_rise, high_y, fill=color, width=1)
+                # high phase
+                self.sequence_canvas.create_line(x_rise, high_y, x_fall, high_y, fill=color, width=1)
+                # falling edge
+                self.sequence_canvas.create_line(x_fall, high_y, x_fall, base_y, fill=color, width=1)
+                x0 = x_fall
 
                 t = t_next
 
@@ -377,8 +474,12 @@ class CoreInstrumentApplication(tk.Tk):
                 lbl = f"{t_tick:.0f}ms" if t_tick == int(t_tick) else f"{t_tick:.1f}ms"
             else:
                 lbl = f"{t_tick/1000:.1f}s"
+            # Anchor the final tick's label so it can't run past the right
+            # edge of the canvas, even with the widened RIGHT_MARGIN.
+            is_last_tick = t_tick + tick_step_ms > total_ms + tick_step_ms * 0.01
+            anchor = "ne" if is_last_tick else "n"
             self.sequence_canvas.create_text(
-                xt, axis_y + 10, text=lbl, fill="#666666", font=("Consolas", 7), anchor="n"
+                xt, axis_y + 10, text=lbl, fill="#666666", font=("Consolas", 7), anchor=anchor
             )
             t_tick += tick_step_ms
 
@@ -469,9 +570,9 @@ class CoreInstrumentApplication(tk.Tk):
 
         ttk.Button(action_box, text="Capture Snapshot Now", command=self.execute_immediate_snapshot).pack(fill="x", pady=2)
         ttk.Button(action_box, text="Extract & Save Background", command=self.capture_background_profile).pack(fill="x", pady=2)
-        
-        self.btn_synch_pulse = tk.Button(action_box, text="Pulse", bg="#2f2525", fg="white", font=("Arial", 11, "bold"), command=self.execute_synch_pulse_routine)
-        self.btn_synch_pulse.pack(fill="x", pady=6)
+        # NOTE: the pulse-trigger button now lives in the top-left panel
+        # (self.btn_synch_pulse is created in build_top_left_panel), next
+        # to the sequence-timing parameters it actually fires.
 
         # Live Display Canvas Layout
         self.camera_canvas = tk.Canvas(video_frame, bg="#0d0d0d", bd=1, relief="sunken")
@@ -490,22 +591,36 @@ class CoreInstrumentApplication(tk.Tk):
         # Split Controls and Plot Layout
         controls_sub = ttk.Frame(container)
         controls_sub.pack(side="top", fill="x", pady=2)
+        controls_sub.columnconfigure(0, weight=1)
 
-        # Magnet toggle switches
+        # Magnet toggle switch. NOTE: the "Synchronize Line with Pulse
+        # Sequence" checkbox that used to sit next to this has moved to
+        # the top-left panel, alongside the pulse-timing parameters it
+        # actually governs.
         self.var_magnet_state = tk.BooleanVar(value=False)
         self.chk_magnet = ttk.Checkbutton(controls_sub, text="Enable Magnet Power (Static DIO 0)", variable=self.var_magnet_state, command=self.toggle_magnet_static_line)
-        self.chk_magnet.grid(row=0, column=0, sticky="w", padx=4)
-
-        self.var_sync_pulse = tk.BooleanVar(value=True)
-        ttk.Checkbutton(controls_sub, text="Synchronize Line with Pulse Sequence", variable=self.var_sync_pulse).grid(row=0, column=1, sticky="w", padx=10)
+        self.chk_magnet.grid(row=0, column=0, sticky="w", padx=4, pady=(0, 2))
+        # Also drives the top-left preview graph's flat "static value" line
+        # for the magnet channel whenever sync is off.
+        self.var_magnet_state.trace_add("write", lambda *args: self.render_sequence_preview_graph())
 
         # CSV Logging Parameter Widgets
         self.var_save_csv = tk.BooleanVar(value=False)
-        ttk.Checkbutton(controls_sub, text="Save 'Fluorescence (PD3)' Trace", variable=self.var_save_csv).grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        ttk.Checkbutton(controls_sub, text="Save 'Fluorescence (PD3)' Trace", variable=self.var_save_csv).grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 0))
+
+        # The path entry + browse button get their own full-width row so
+        # the entry can shrink/grow with the panel while the button always
+        # keeps its natural size -- previously both shared row 1 of a
+        # 3-column grid with no expanding column, so at narrower panel
+        # widths the "Browse Destination" button ran past the edge of the
+        # panel and was cut off.
+        path_row = ttk.Frame(controls_sub)
+        path_row.grid(row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 4))
+        path_row.columnconfigure(0, weight=1)
 
         self.var_csv_path = tk.StringVar(value=os.path.join(os.getcwd(), "fluorescence_output.csv"))
-        ttk.Entry(controls_sub, textvariable=self.var_csv_path, width=40).grid(row=1, column=1, sticky="w", padx=4)
-        ttk.Button(controls_sub, text="Browse Destination", command=self.browse_csv_destination_file).grid(row=1, column=2, padx=4)
+        ttk.Entry(path_row, textvariable=self.var_csv_path).grid(row=0, column=0, sticky="ew")
+        ttk.Button(path_row, text="Browse Destination", command=self.browse_csv_destination_file).grid(row=0, column=1, padx=(6, 0))
 
         # WaveForms Oscilloscope Trace Visual Canvas Display Component
         ttk.Label(container, text="Oscilloscope Buffer Display: Channel 0 (Fluorescence Array Data)").pack(anchor="w", pady=(6,0))
@@ -514,23 +629,30 @@ class CoreInstrumentApplication(tk.Tk):
         self.scope_canvas = tk.Canvas(container, bg="#000000", height=180, highlightthickness=0)
         self.scope_canvas.pack(fill="both", expand=True, pady=4)
 
+        # Keep the most recent trace so the axes/labels can be redrawn
+        # cleanly if the panel is resized (or before any trace exists,
+        # in which case just the empty axes are shown).
+        self._last_scope_voltages = np.array([])
+        self._last_scope_duration_s = None
+        self.scope_canvas.bind("<Configure>", lambda evt: self.render_oscilloscope_canvas_trace(
+            self._last_scope_voltages, self._last_scope_duration_s
+        ))
+
     def build_bottom_right_panel(self):
         """Maintains image subtraction data arrays, displaying original and processed streams side by side."""
         container = ttk.Frame(self.p_bottom_right, padding=6)
         container.pack(fill="both", expand=True)
 
-        # Config layout definitions
-        self.var_auto_save_pulsed_img = tk.BooleanVar(value=False)
-        self.var_pulse_filename_base = tk.StringVar(value="pulsed_frame_capture")
-
+        # NOTE: the "Auto-Save Pulse Image Arrays" checkbox and base
+        # filename entry have moved to the top-left panel
+        # (self.var_auto_save_pulsed_img / self.var_pulse_filename_base are
+        # created in build_top_left_panel), next to the Pulse button that
+        # triggers the capture they control.
         top_config = ttk.Frame(container)
         top_config.pack(side="top", fill="x", pady=2)
 
-        ttk.Checkbutton(top_config, text="Auto-Save Pulse Image Arrays", variable=self.var_auto_save_pulsed_img).grid(row=0, column=0, padx=4, sticky="w")
-        ttk.Label(top_config, text="Base Filename:").grid(row=0, column=1, padx=4, sticky="w")
-        ttk.Entry(top_config, textvariable=self.var_pulse_filename_base, width=20).grid(row=0, column=2, padx=4, sticky="w")
-        ttk.Button(top_config, text="Manually Save Current Snapshot", command=self.save_current_snapshot_manually).grid(row=0, column=3, padx=10, sticky="w")
-        ttk.Button(top_config, text="Clear Subtraction Background", command=self.clear_background_buffer).grid(row=0, column=4, padx=4, sticky="w")
+        ttk.Button(top_config, text="Manually Save Current Snapshot", command=self.save_current_snapshot_manually).grid(row=0, column=0, padx=(4, 10), sticky="w")
+        ttk.Button(top_config, text="Clear Subtraction Background", command=self.clear_background_buffer).grid(row=0, column=1, padx=4, sticky="w")
 
         # Two-channel Display Viewport Sub-frames
         viewport_frame = ttk.Frame(container)
@@ -910,16 +1032,16 @@ class CoreInstrumentApplication(tk.Tk):
             try:
                 # 1. Gather all GUI operational parameters safely
                 #
-                # NOTE: `delay_to_snap_*` (GUI label "Time after pulse to
-                # snap") only feeds the timing-preview graph now. With the
-                # camera hardware-triggered on DIO2's falling edge, the
-                # camera pulse's own high-time is what determines when the
-                # trigger fires -- there's no separate snap-delay for the
-                # pulse-sequence engine to apply.
+                # `delay_to_snap_*` (GUI label "Time after pulse to snap")
+                # directly sets the camera (DIO2) pulse's high-time. DIO2
+                # shares its RISING edge with the magnet/shutter channels,
+                # but has a shorter high-time so its FALLING edge -- which
+                # is what the camera is hardware-triggered on -- lands
+                # exactly "time after pulse to snap" after the pulse train
+                # starts.
                 delay_to_snap_ms = self.var_time_after_pulse.get()
                 pd3_domain_ms = self.var_pd3_window.get()
                 total_pulses = self.var_num_pulses.get()
-                step_len_ms = self.var_step_length.get()
                 
                 # Math translations scaling parameters to seconds
                 delay_to_snap_s = delay_to_snap_ms / 1000.0
@@ -952,10 +1074,20 @@ class CoreInstrumentApplication(tk.Tk):
                           "capture (the DIO2 camera-sync pulse never fires without the ADS pulse train).")
 
                 if self.ads:
-                    between_s   = self.var_time_between_pulses.get()
+                    between_s = self.var_time_between_pulses.get()
+                    # All channels share the same repeat period
+                    # (pd3_domain_s + between_s) so they stay in phase
+                    # across repeated pulses. The camera (DIO2) pin gets a
+                    # shorter high-time -- delay_to_snap_s instead of the
+                    # full pd3_domain_s -- with its low-time padded out so
+                    # its period still matches every other channel.
+                    period_s = pd3_domain_s + between_s
+                    cam_high_s = max(0.0, min(delay_to_snap_s, period_s))
+                    cam_low_s = period_s - cam_high_s
+
                     pulse_pins  = [1, 2]
-                    pulse_highs = [pd3_domain_s, pd3_domain_s]
-                    pulse_lows  = [between_s, between_s]
+                    pulse_highs = [pd3_domain_s, cam_high_s]
+                    pulse_lows  = [between_s, cam_low_s]
 
                     if self.var_sync_pulse.get():
                         pulse_pins.insert(0, 0)
@@ -985,24 +1117,25 @@ class CoreInstrumentApplication(tk.Tk):
                     # silently producing no visible edge.
                     try:
                         clk = self.ads.digital_out_get_internal_clock()
-                        min_high_ticks = round(clk * pd3_domain_s)
-                        if min_high_ticks < 1:
-                            print(f"[Pulse Engine][WARNING] high_time={pd3_domain_s*1e6:.1f}us "
-                                  f"rounds to <1 tick at clk={clk/1e6:.1f}MHz -- pulse will be "
-                                  f"effectively zero width and may not be visible.")
+                        for chan_name, chan_high_s in (("shutter/magnet", pd3_domain_s), ("camera", cam_high_s)):
+                            min_high_ticks = round(clk * chan_high_s)
+                            if min_high_ticks < 1:
+                                print(f"[Pulse Engine][WARNING] {chan_name} high_time={chan_high_s*1e6:.1f}us "
+                                      f"rounds to <1 tick at clk={clk/1e6:.1f}MHz -- pulse will be "
+                                      f"effectively zero width and may not be visible.")
                     except Exception:
                         pass
 
                     # Arm the camera's hardware trigger BEFORE firing the
                     # pulse train, so it is already waiting in hardware when
-                    # the DIO2 camera-sync pulse arrives. Triggering on the
-                    # FALLING edge means exposure starts the instant DIO2
-                    # drops back low -- i.e. exactly pd3_domain_s (the
-                    # camera pulse's own high-time) after the pulse train
-                    # starts. That makes the camera pulse's *length* the
-                    # only knob controlling trigger timing; there's no
-                    # separate delay to keep in sync against the other
-                    # channels (compare to the old approach, which grabbed
+                    # the DIO2 camera-sync pulse arrives. DIO2 rises at the
+                    # same instant as the shutter/magnet channels, but
+                    # falls back low after only cam_high_s (== "time after
+                    # pulse to snap"). Triggering on the FALLING edge means
+                    # exposure starts the instant DIO2 drops low again --
+                    # i.e. exactly delay_to_snap_s after the pulse train
+                    # starts, regardless of how long the PD3 domain itself
+                    # runs (compare to the old approach, which grabbed
                     # whatever frame happened to be sitting in the live
                     # view buffer with no real timing relationship to the
                     # pulse at all).
@@ -1143,7 +1276,9 @@ class CoreInstrumentApplication(tk.Tk):
                 print(f"[Auto-Save Matrix] Pulse snapshot saved: {filename}")
 
         if scope_voltages is not None and len(scope_voltages) > 0:
-            self.render_oscilloscope_canvas_trace(scope_voltages)
+            self._last_scope_voltages = scope_voltages
+            self._last_scope_duration_s = total_duration_s
+            self.render_oscilloscope_canvas_trace(scope_voltages, total_duration_s)
             
             # Save the raw voltage trace array against its time indices to a CSV file if enabled
             if self.var_save_csv.get():
@@ -1162,38 +1297,96 @@ class CoreInstrumentApplication(tk.Tk):
         # Restore system state variables to resume normal live operations
         self.reset_interface_execution_safeguards()
 
-    def render_oscilloscope_canvas_trace(self, voltage_array):
-        """Draws the oscilloscope trace onto the canvas."""
+    def render_oscilloscope_canvas_trace(self, voltage_array, total_duration_s=None):
+        """Draws the oscilloscope trace onto the canvas, with labeled X (time) and Y (voltage) axes."""
         self.scope_canvas.delete("all")
         w = self.scope_canvas.winfo_width()
         h = self.scope_canvas.winfo_height()
         if w < 10 or h < 10:
             w, h = 500, 180
 
-        # Draw grid reference lines
-        self.scope_canvas.create_line(0, h//2, w, h//2, fill="#222222")
-        
-        if len(voltage_array) < 2:
+        # Axis layout constants
+        LEFT_MARGIN   = 55   # room for voltage tick labels
+        RIGHT_MARGIN  = 12
+        TOP_MARGIN    = 10
+        BOTTOM_MARGIN = 26   # room for time tick labels
+        plot_x0 = LEFT_MARGIN
+        plot_x1 = w - RIGHT_MARGIN
+        plot_y0 = TOP_MARGIN
+        plot_y1 = h - BOTTOM_MARGIN
+        plot_w  = plot_x1 - plot_x0
+        plot_h  = plot_y1 - plot_y0
+
+        if plot_w <= 0 or plot_h <= 0:
             return
 
-        # Normalize arrays values into geometric visual heights
-        v_min, v_max = np.min(voltage_array), np.max(voltage_array)
+        has_data = voltage_array is not None and len(voltage_array) >= 2
+        if has_data:
+            v_min, v_max = float(np.min(voltage_array)), float(np.max(voltage_array))
+        else:
+            v_min, v_max = 0.0, 1.0
         span = (v_max - v_min) if (v_max - v_min) > 0.01 else 1.0
-        
+
+        # Mid-scale grid reference line
+        mid_y = plot_y0 + plot_h / 2
+        self.scope_canvas.create_line(plot_x0, mid_y, plot_x1, mid_y, fill="#222222")
+
+        # --- Y axis (voltage) ---
+        self.scope_canvas.create_line(plot_x0, plot_y0, plot_x0, plot_y1, fill="#555555", width=1)
+        n_y_ticks = 4
+        for i in range(n_y_ticks + 1):
+            frac = i / n_y_ticks
+            y_val = v_max - frac * span
+            y_pix = plot_y0 + frac * plot_h
+            self.scope_canvas.create_line(plot_x0 - 4, y_pix, plot_x0, y_pix, fill="#555555")
+            self.scope_canvas.create_text(
+                plot_x0 - 6, y_pix, text=f"{y_val:.3f}V", fill="#888888",
+                font=("Arial", 8), anchor="e"
+            )
+        self.scope_canvas.create_text(
+            12, plot_y0 - 2, text="V", fill="#888888", font=("Arial", 8), anchor="nw"
+        )
+
+        # --- X axis (time) ---
+        self.scope_canvas.create_line(plot_x0, plot_y1, plot_x1, plot_y1, fill="#555555", width=1)
+        n_x_ticks = 5
+        duration_ms = (total_duration_s * 1000.0) if total_duration_s else None
+        for i in range(n_x_ticks + 1):
+            frac = i / n_x_ticks
+            x_pix = plot_x0 + frac * plot_w
+            self.scope_canvas.create_line(x_pix, plot_y1, x_pix, plot_y1 + 4, fill="#555555")
+            if duration_ms is not None:
+                t_val = frac * duration_ms
+                lbl = f"{t_val:.1f}ms"
+            else:
+                # No timing context available (e.g. before the first trace)
+                # -- fall back to a fraction-of-buffer label.
+                lbl = f"{frac:.1f}"
+            anchor = "n" if i not in (0, n_x_ticks) else ("nw" if i == 0 else "ne")
+            self.scope_canvas.create_text(
+                x_pix, plot_y1 + 6, text=lbl, fill="#888888", font=("Arial", 8), anchor=anchor
+            )
+        self.scope_canvas.create_text(
+            plot_x1, h - 4, text="Time", fill="#888888", font=("Arial", 8), anchor="se"
+        )
+
+        if not has_data:
+            return
+
+        # Normalize array values into geometric visual heights within the plot box
         points = []
         for idx, val in enumerate(voltage_array):
-            x_pixel = int((idx / len(voltage_array)) * w)
-            # Center and fit the signal trace to the canvas height
-            y_pixel = int(h - 20 - ((val - v_min) / span) * (h - 40))
+            x_pixel = plot_x0 + (idx / (len(voltage_array) - 1)) * plot_w
+            y_pixel = plot_y1 - ((val - v_min) / span) * plot_h
             points.append((x_pixel, y_pixel))
 
         # Flatten point pairs and render a smooth line sequence
         flat_points = [coord for pt in points for coord in pt]
         self.scope_canvas.create_line(flat_points, fill="#00ff00", width=1.5)
-        
+
         # Add tracking labels to the visual scale bounds
-        self.scope_canvas.create_text(35, 15, text=f"Max: {v_max:.3f} V", fill="#888888", font=("Arial", 8))
-        self.scope_canvas.create_text(35, h - 15, text=f"Min: {v_min:.3f} V", fill="#888888", font=("Arial", 8))
+        self.scope_canvas.create_text(plot_x1 - 4, plot_y0 + 10, text=f"Max: {v_max:.3f} V", fill="#888888", font=("Arial", 8), anchor="e")
+        self.scope_canvas.create_text(plot_x1 - 4, plot_y1 - 10, text=f"Min: {v_min:.3f} V", fill="#888888", font=("Arial", 8), anchor="e")
 
     def reset_interface_execution_safeguards(self):
         """Re-enables the GUI inputs and resumes the live video processing loop safely."""
