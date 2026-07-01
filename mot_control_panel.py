@@ -165,26 +165,7 @@ class CoreInstrumentApplication(tk.Tk):
                 except Exception:
                     pass
 
-                # The waveforms_ads wrapper doesn't expose a documented
-                # high-level close()/dispose() in this codebase (every
-                # other call site in this file reaches directly into
-                # self.ads._dwf / self.ads._hdwf for low-level operations
-                # that aren't wrapped), so prefer a close()-style method if
-                # one exists, and fall back to calling the underlying
-                # FDwfDeviceClose() directly so the device handle is
-                # actually released and the AD board shows back up as
-                # available the next time this app is started.
-                closed = False
-                for close_method_name in ("close", "dispose", "shutdown"):
-                    close_method = getattr(self.ads, close_method_name, None)
-                    if callable(close_method):
-                        close_method()
-                        closed = True
-                        break
-                if not closed and hasattr(self.ads, "_dwf") and hasattr(self.ads, "_hdwf"):
-                    self.ads._dwf.FDwfDeviceClose(self.ads._hdwf)
-                    closed = True
-                print(f"[Shutdown] Analog Discovery device {'closed' if closed else 'left as-is (no close hook found)'}.")
+                self.ads.close()
             except Exception as e:
                 print(f"[Shutdown] Error closing Analog Discovery device: {e}")
             finally:
@@ -231,11 +212,8 @@ class CoreInstrumentApplication(tk.Tk):
             print(f"[Warning] Analog Discovery device could not connect: {e}")
             self.ads = None
 
-        # Discovered hardware-trigger vocabulary for the connected camera.
         # Different Allied Vision models expose different GPIO line names
-        # and trigger selector entries -- "Line1" / "FrameStart" are common
-        # but NOT universal, and feeding an unsupported name to the camera
-        # raises a GenICam "no enum entry" error. Query what this specific
+        # and trigger selector entries. Query what this specific
         # camera actually supports instead of hardcoding a guess.
         self.available_trigger_lines = []
         self.available_trigger_sources = []
