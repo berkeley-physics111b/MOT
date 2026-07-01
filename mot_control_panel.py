@@ -601,6 +601,23 @@ class CoreInstrumentApplication(tk.Tk):
         except Exception as e:
             messagebox.showerror("Hardware Communication Error", f"Unable to update camera settings block: {e}")
 
+    def _resolve_trigger_selector(self):
+        """
+        Map the GUI's selected trigger-selector string back onto the
+        TriggerSelector enum expected by HardwareTriggerConfig.
+
+        Different camera models can report GenICam selector names that
+        don't line up with one of the enum's known values -- fall back to
+        FRAME_START (universally supported by Allied Vision cameras)
+        rather than raising in the middle of a pulse sequence.
+        """
+        try:
+            return TriggerSelector(self.var_trigger_selector.get())
+        except ValueError:
+            print(f"[Camera] Unknown trigger selector '{self.var_trigger_selector.get()}'; "
+                  f"defaulting to FrameStart.")
+            return TriggerSelector.FRAME_START
+
     def toggle_magnet_static_line(self):
         """Drives manual state level adjustments across the static digital registers.
 
@@ -880,6 +897,13 @@ class CoreInstrumentApplication(tk.Tk):
         def sequence_execution_worker():
             try:
                 # 1. Gather all GUI operational parameters safely
+                #
+                # NOTE: `delay_to_snap_*` (GUI label "Time after pulse to
+                # snap") only feeds the timing-preview graph now. With the
+                # camera hardware-triggered on DIO2's falling edge, the
+                # camera pulse's own high-time is what determines when the
+                # trigger fires -- there's no separate snap-delay for the
+                # pulse-sequence engine to apply.
                 delay_to_snap_ms = self.var_time_after_pulse.get()
                 pd3_domain_ms = self.var_pd3_window.get()
                 total_pulses = self.var_num_pulses.get()
@@ -904,6 +928,16 @@ class CoreInstrumentApplication(tk.Tk):
                 #   DIO 2 – camera sync
                 pulse_done_event = threading.Event()
                 pulse_error      = [None]
+
+                # Whether the camera was successfully armed for a
+                # hardware-triggered capture below. Hardware-triggered
+                # capture is driven entirely by the DIO2 camera-sync pulse
+                # coming out of the ADS pattern generator, so without an
+                # ADS connection there is no edge to trigger on.
+                camera_hw_armed = False
+                if self.camera and self.camera._cam and not self.ads:
+                    print("[Pulse Engine Camera] No ADS connected -- skipping hardware-triggered "
+                          "capture (the DIO2 camera-sync pulse never fires without the ADS pulse train).")
 
                 if self.ads:
                     between_s   = self.var_time_between_pulses.get()
@@ -947,6 +981,36 @@ class CoreInstrumentApplication(tk.Tk):
                     except Exception:
                         pass
 
+                    # Arm the camera's hardware trigger BEFORE firing the
+                    # pulse train, so it is already waiting in hardware when
+                    # the DIO2 camera-sync pulse arrives. Triggering on the
+                    # FALLING edge means exposure starts the instant DIO2
+                    # drops back low -- i.e. exactly pd3_domain_s (the
+                    # camera pulse's own high-time) after the pulse train
+                    # starts. That makes the camera pulse's *length* the
+                    # only knob controlling trigger timing; there's no
+                    # separate delay to keep in sync against the other
+                    # channels (compare to the old approach, which grabbed
+                    # whatever frame happened to be sitting in the live
+                    # view buffer with no real timing relationship to the
+                    # pulse at all).
+                    if self.camera and self.camera._cam:
+                        try:
+                            hw_cfg = HardwareTriggerConfig(
+                                line=self.var_trigger_line.get(),
+                                selector=self._resolve_trigger_selector(),
+                                activation=TriggerActivation.FALLING_EDGE,
+                                acquisition_mode=AcquisitionMode.SINGLE_FRAME,
+                                timeout_s=pulse_timeout,
+                            )
+                            self.camera.arm_hardware_trigger(hw_cfg)
+                            camera_hw_armed = True
+                            print(f"[Pulse Engine Camera] Armed hardware trigger on "
+                                  f"{hw_cfg.line} ({hw_cfg.activation.value}), "
+                                  f"selector={hw_cfg.selector.value}.")
+                        except Exception as err:
+                            print(f"[Pulse Engine Camera] Could not arm hardware trigger: {err}")
+
                     def _fire_pulse_train():
                         try:
                             self.ads.digital_out_pulse_train(
@@ -988,18 +1052,22 @@ class CoreInstrumentApplication(tk.Tk):
                     print(f"[Pulse Engine] Oscilloscope armed: {scope_buffer_samples} "
                           f"samples @ {scope_sample_rate/1e3:.0f} kHz")
 
-                # 4. Take camera snapshot while pulse is running.
+                # 4. Block until the camera's hardware trigger fires (DIO2
+                # falling edge) and the triggered frame arrives. The camera
+                # was already armed and waiting in hardware above, so this
+                # just picks up the frame -- no delay to coordinate against
+                # the pulse train, since the falling edge IS the trigger.
                 captured_frame = None
-                if self.camera and self.camera._cam:
+                if camera_hw_armed:
                     try:
-                        # TODO: switch to hardware trigger when wiring is confirmed
-                        # 'software trigger' not possible with old guppy (?) so removed
-                        # need to re-examine that function in allied_vision_camera.py
-                        # trigger on falling edge so don't need different delays for pulses?
-                        self.execute_immediate_snapshot()
-                        captured_frame = self.latest_live_frame()
+                        captured_frame = self.camera.wait_for_hardware_trigger(timeout_s=pulse_timeout)
                     except Exception as err:
-                        print(f"[Pulse Engine Camera] Snapshot failed: {err}")
+                        print(f"[Pulse Engine Camera] Hardware-triggered capture failed: {err}")
+                    finally:
+                        try:
+                            self.camera.disarm_hardware_trigger()
+                        except Exception as err:
+                            print(f"[Pulse Engine Camera] Could not disarm hardware trigger: {err}")
 
                 # 5. Wait for the pulse train to complete, then read scope data.
                 _wait_timeout = (total_run_s + 2.0) if self.ads else 1.0

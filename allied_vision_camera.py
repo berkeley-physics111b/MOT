@@ -708,7 +708,7 @@ class AlliedVisionCamera:
         Parameters
         ----------
         hw_config:
-            Hardware trigger parameters (line, edge, selector, mode, …).
+            Hardware trigger parameters (line, source, edge, selector, mode, …).
         callback:
             Optional ``fn(image: np.ndarray, timestamp: float) -> None``
             called from the VmbPy callback thread each time a triggered frame
