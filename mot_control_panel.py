@@ -146,6 +146,7 @@ class CoreInstrumentApplication(tk.Tk):
         # raises a GenICam "no enum entry" error. Query what this specific
         # camera actually supports instead of hardcoding a guess.
         self.available_trigger_lines = []
+        self.available_trigger_sources = []
         self.available_trigger_selectors = []
 
         try:
