@@ -89,6 +89,15 @@ class CoreInstrumentApplication(tk.Tk):
         self.latest_pulsed_snapshot = None
         self.live_view_active = True
 
+        # True while a pulse sequence's background worker thread is
+        # actively talking to self.ads / self.camera (arming triggers,
+        # polling the scope, etc.). Neither hardware wrapper is
+        # thread-safe against its own close() being called concurrently,
+        # so on_app_close() must wait for this to clear before tearing
+        # down any device handles -- see on_app_close() for details.
+        self._sequence_running = False
+        self._shutdown_waiting_on_sequence = False
+
         # Persistent canvas image item id for the live view; reused via
         # itemconfig() on every frame instead of stacking a fresh
         # create_image() each time (which previously leaked one canvas
@@ -128,6 +137,25 @@ class CoreInstrumentApplication(tk.Tk):
         the window is torn down, or a queued callback can fire against
         widgets that no longer exist.
         """
+        # A pulse sequence's worker thread (see execute_synch_pulse_routine)
+        # actively drives self.ads / self.camera from a background thread
+        # with no locking shared against close(). Closing those devices out
+        # from under an in-flight hardware call is what previously froze
+        # the app on shutdown -- the vendor SDK calls block forever waiting
+        # on a device handle that's being torn down mid-operation. Instead
+        # of closing immediately, re-check on the Tk main loop every 150 ms
+        # until the worker thread signals it's done (reset_interface_
+        # execution_safeguards clears self._sequence_running). This keeps
+        # the GUI responsive rather than blocking, and is bounded because
+        # every wait inside the worker thread has its own timeout (5-10 s).
+        if self._sequence_running:
+            if not self._shutdown_waiting_on_sequence:
+                self._shutdown_waiting_on_sequence = True
+                print("[Shutdown] Pulse sequence still running -- waiting for it to finish before releasing hardware...")
+                self.title("MOT Control Panel (finishing pulse sequence before closing...)")
+            self.after(150, self.on_app_close)
+            return
+
         print("[Shutdown] Close requested -- releasing hardware handles...")
 
         # Stop the live-view callback path first so no further frames get
@@ -366,6 +394,9 @@ class CoreInstrumentApplication(tk.Tk):
         ).grid(row=0, column=0, padx=(4, 8), sticky="w")
         ttk.Label(autosave_row, text="Base Filename:").grid(row=0, column=1, sticky="w")
         ttk.Entry(autosave_row, textvariable=self.var_pulse_filename_base).grid(row=0, column=2, padx=4, sticky="ew")
+        ttk.Button(
+            autosave_row, text="Browse", command=self.browse_pulse_filename_base
+        ).grid(row=0, column=3, padx=(4, 0))
 
         # Re-draw the visual timing preview trace every time values shift
         for var in [self.var_time_after_pulse, self.var_time_between_pulses, self.var_pd3_window]:
@@ -865,6 +896,33 @@ class CoreInstrumentApplication(tk.Tk):
         if file_path:
             self.var_csv_path.set(file_path)
 
+    def browse_pulse_filename_base(self):
+        """
+        Launches a save dialog so the user can point auto-saved pulse
+        snapshots at a different folder (and/or change the base filename).
+
+        var_pulse_filename_base is a *base* path, not a full filename --
+        finalize_and_render_pulse_metrics() appends "_{timestamp}.png" to
+        it for every saved frame. So rather than asking for a single file,
+        this seeds the dialog with the current folder/name and strips
+        whatever extension the OS dialog appends back off the result,
+        leaving a bare base path (which may include a directory) that the
+        timestamp + extension get appended to later.
+        """
+        current = self.var_pulse_filename_base.get()
+        initial_dir = os.path.dirname(current) or os.getcwd()
+        initial_file = os.path.basename(current) or "pulsed_frame_capture"
+        file_path = filedialog.asksaveasfilename(
+            initialdir=initial_dir,
+            initialfile=initial_file,
+            defaultextension="",
+            filetypes=[("All files", "*.*")],
+            title="Choose folder + base filename for auto-saved pulse snapshots",
+        )
+        if file_path:
+            base, _ext = os.path.splitext(file_path)
+            self.var_pulse_filename_base.set(base)
+
     # =========================================================================
     # LIVE VIEW STREAM PROCESSING LOOP
     # =========================================================================
@@ -1096,6 +1154,11 @@ class CoreInstrumentApplication(tk.Tk):
         # Visual indicators locking downstream operations
         self.btn_synch_pulse.config(text="RUNNING SEQUENCE...", state="disabled")
         self.live_view_active = False # Pause top-right continuous loop tracking
+
+        # Mark the sequence as in-flight so on_app_close() knows not to
+        # close self.ads / self.camera out from under the worker thread
+        # below (which will still be actively using both).
+        self._sequence_running = True
 
         # take_snapshot()/arm_hardware_trigger() both raise if continuous
         # streaming is still active, so stop it here on the main thread
@@ -1466,6 +1529,10 @@ class CoreInstrumentApplication(tk.Tk):
         """Re-enables the GUI inputs and resumes the live video processing loop safely."""
         self.btn_synch_pulse.config(text="PULSE", state="normal")
         self.live_view_active = True
+        # The worker thread is done touching self.ads / self.camera now,
+        # so it's safe for on_app_close() to proceed with hardware
+        # teardown if a close request was left waiting on this.
+        self._sequence_running = False
         self._start_camera_live_view()
 
 if __name__ == "__main__":
