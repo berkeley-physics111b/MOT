@@ -1627,35 +1627,146 @@ class WaveFormsADS:
             "FDwfDigitalOutDataSet",
         )
 
-    # ------------------------------------------------------------------
-    # Digital Out – Helper: compute divider & counts from seconds
-    # ------------------------------------------------------------------
+    # Conservative fallback used only if the device/SDK can't report its
+    # actual custom-data buffer depth (see digital_out_get_custom_data_max_bits).
+    _FALLBACK_MAX_CUSTOM_BITS = 1 << 20  # 1,048,576 samples
 
-    def _digital_out_time_to_ticks(
-        self, seconds: float, channel: int = 0
-    ) -> Tuple[int, int]:
+    def digital_out_get_custom_data_max_bits(self, channel: int) -> int:
         """
-        Convert a duration in seconds to ``(divider, tick_count)`` such that:
-        ``tick_count`` divider cycles ≈ ``seconds`` at the internal clock.
+        Return the maximum number of custom-pattern bits/samples ``channel``
+        can hold (DwfDigitalOutTypeCustom buffer depth), via
+        ``FDwfDigitalOutDataInfo``.
 
-        The divider is chosen to keep ``tick_count`` within the hardware counter
-        range (≤ 2^32 - 1) while maximising timing resolution.
+        Falls back to a conservative constant if the underlying SDK call is
+        unavailable (older dwf.dll/libdwf.so) or fails for any reason, so
+        pattern generation degrades gracefully instead of raising.
+        """
+        try:
+            n = ctypes.c_uint(0)
+            self._check(
+                self._dwf.FDwfDigitalOutDataInfo(self._hdwf, channel, ctypes.byref(n)),
+                "FDwfDigitalOutDataInfo",
+            )
+            if n.value > 0:
+                return int(n.value)
+        except (AttributeError, DWFError):
+            pass
+        return self._FALLBACK_MAX_CUSTOM_BITS
+
+    # ------------------------------------------------------------------
+    # Digital Out – Helper: build a single HIGH->LOW custom-pattern cycle
+    # ------------------------------------------------------------------
+    #
+    # DwfDigitalOutTypePulse drives its HIGH and LOW phases from two 32-bit
+    # hardware tick-counters (FDwfDigitalOutCounterSet) that share a single
+    # per-channel divider. When high_time_s and low_time_s differ by a large
+    # ratio (e.g. a long "time between pulses" against a short trigger
+    # pulse), the divider needed to keep the *longer* phase's tick count
+    # under 2^32-1 forces the *shorter* phase down to a handful of ticks --
+    # or clamps it to the 1-tick floor, silently distorting or truncating
+    # that phase's requested duration. Because the counters are hard 32-bit
+    # registers, there is no divider choice that fixes this for extreme
+    # ratios: something has to give.
+    #
+    # DwfDigitalOutTypeCustom instead plays an explicit bit pattern out of a
+    # buffer at a programmable sample rate (also internal_clock / divider).
+    # We build that pattern here as exactly one HIGH-then-LOW cycle sized to
+    # the *requested* high_time_s / low_time_s, choosing the divider purely
+    # to fit the cycle into the channel's available buffer depth (typically
+    # far more forgiving than a fixed 32-bit tick ceiling, and shared fairly
+    # between both phases rather than being dictated by whichever phase is
+    # longest). Repeats are deliberately NOT baked into this pattern -- the
+    # caller loops this single cycle via FDwfDigitalOutRunSet/RepeatSet, the
+    # same mechanism used for DwfDigitalOutTypePulse today.
+
+    def _build_custom_pulse_bits(
+        self,
+        high_time_s: float,
+        low_time_s: float,
+        clk: float,
+        max_bits: int,
+    ) -> Tuple[int, np.ndarray, float, float]:
+        """
+        Build one HIGH->LOW custom-pattern cycle for the requested phase
+        durations.
 
         Returns
         -------
-        (divider, tick_count) : (int, int)
-            Both values are ≥ 1.
+        (divider, bits, achieved_high_s, achieved_low_s)
+            ``bits`` is a uint8 array of 0/1 samples (HIGH samples first,
+            then LOW samples) suitable for ``digital_out_set_custom_data``.
+            ``achieved_high_s``/``achieved_low_s`` are the actual phase
+            durations produced once the requested times are rounded to whole
+            samples at the chosen divider -- use these (not the requested
+            times) to compute run/repeat timing so reported durations match
+            what the hardware will actually output.
         """
-        clk = self.digital_out_get_internal_clock()
-        total_ticks = round(clk * seconds)
-        if total_ticks < 1:
-            total_ticks = 1
-        MAX_COUNT = 0xFFFF_FFFF  # 32-bit counter
-        divider = 1
-        while total_ticks // divider > MAX_COUNT:
+        if high_time_s < 0 or low_time_s < 0:
+            raise ValueError("high_time_s and low_time_s must be >= 0")
+        if high_time_s <= 0 and low_time_s <= 0:
+            raise ValueError("at least one of high_time_s / low_time_s must be > 0")
+        if max_bits < 2:
+            max_bits = 2
+
+        raw_high = clk * high_time_s
+        raw_low  = clk * low_time_s
+        raw_total = raw_high + raw_low
+
+        # Smallest divider that brings the whole cycle within the buffer.
+        divider = max(1, int(-(-raw_total // max_bits)))  # ceil division
+
+        def _phase_bits(raw: float, requested_s: float, div: int) -> int:
+            if requested_s <= 0:
+                return 0
+            return max(1, round(raw / div))
+
+        # Rounding (and the >=1 floor for a requested-but-fractional phase)
+        # can occasionally push the total a bit over max_bits; growing the
+        # divider a few more steps always converges quickly since raw_total
+        # shrinks roughly linearly with it.
+        while True:
+            high_bits = _phase_bits(raw_high, high_time_s, divider)
+            low_bits  = _phase_bits(raw_low,  low_time_s,  divider)
+            if high_bits + low_bits <= max_bits:
+                break
             divider += 1
-        tick_count = max(1, round(total_ticks / divider))
-        return divider, tick_count
+
+        bits = np.zeros(high_bits + low_bits, dtype=np.uint8)
+        bits[:high_bits] = 1  # HIGH samples first, then LOW samples
+
+        achieved_high_s = high_bits * divider / clk
+        achieved_low_s  = low_bits  * divider / clk
+        return divider, bits, achieved_high_s, achieved_low_s
+
+    @staticmethod
+    def _warn_if_pulse_timing_off(
+        pin, requested_high_s, requested_low_s, achieved_high_s, achieved_low_s,
+        rel_tol: float = 0.01,
+    ) -> None:
+        """
+        Print a console warning if the custom-pattern rounding pushed either
+        phase's achieved duration more than ``rel_tol`` (relative) away from
+        what was requested. This most often happens when the ratio between
+        ``high_time_s`` and ``low_time_s`` is extreme relative to the
+        channel's custom-data buffer depth -- the same class of trade-off
+        the old 32-bit tick counters had, just governed by buffer size
+        instead of register width.
+        """
+        for label, req, ach in (
+            ("high", requested_high_s, achieved_high_s),
+            ("low",  requested_low_s,  achieved_low_s),
+        ):
+            if req <= 0:
+                continue
+            rel_err = abs(ach - req) / req
+            if rel_err > rel_tol:
+                print(
+                    f"[digital_out] pin {pin}: {label}_time requested="
+                    f"{req*1e6:.3f}us, achieved={ach*1e6:.3f}us "
+                    f"({rel_err*100:.1f}% off) -- the high/low ratio is "
+                    f"large relative to this channel's custom-pattern "
+                    f"buffer depth, so resolution had to be traded off."
+                )
 
     # ------------------------------------------------------------------
     # Digital Out – High-level pulse helpers
@@ -1715,40 +1826,48 @@ class WaveFormsADS:
         -------
         >>> # Single 1 ms pulse on pin 0 (idle low)
         >>> dev.digital_out_pulse(pin=0, high_time_s=1e-3, low_time_s=1e-3)
+
+        Notes
+        -----
+        Internally this plays a DwfDigitalOutTypeCustom bit pattern
+        containing exactly one HIGH->LOW cycle (built by
+        ``_build_custom_pulse_bits``), rather than programming
+        DwfDigitalOutTypePulse's 32-bit hardware tick-counters directly.
+        This avoids the precision loss/clamping those counters suffer when
+        ``high_time_s`` and ``low_time_s`` differ by a large ratio.
+        ``pulse_count`` repeats are applied afterwards via the run-time /
+        repeat settings -- the pattern itself always represents a single
+        cycle.
         """
         self.digital_out_reset()
 
         clk = self.digital_out_get_internal_clock()
+        max_bits = self.digital_out_get_custom_data_max_bits(pin)
 
-        # --- Compute divider (shared between high and low phases) -----
-        # Choose a divider that fits both high_time and low_time without
-        # exceeding the 32-bit counter limit.
-        MIN_TICKS = 1
-        MAX_COUNT = 0xFFFF_FFFF
-        total_high = max(MIN_TICKS, round(clk * high_time_s))
-        total_low  = max(MIN_TICKS, round(clk * low_time_s))
-        divider = 1
-        while (total_high // divider > MAX_COUNT or
-               total_low  // divider > MAX_COUNT):
-            divider += 1
-        high_ticks = max(1, round(total_high / divider))
-        low_ticks  = max(1, round(total_low  / divider))
+        divider, bits, achieved_high_s, achieved_low_s = self._build_custom_pulse_bits(
+            high_time_s, low_time_s, clk, max_bits
+        )
+        self._warn_if_pulse_timing_off(
+            pin, high_time_s, low_time_s, achieved_high_s, achieved_low_s
+        )
 
         # --- Channel configuration ------------------------------------
         self.digital_out_enable_channel(pin, True)
         self.digital_out_set_output_mode(pin, output_mode)
-        self.digital_out_set_type(pin, DwfDigitalOutTypePulse)
+        self.digital_out_set_type(pin, DwfDigitalOutTypeCustom)
         self.digital_out_set_idle(pin, idle_state)
         self.digital_out_set_divider_init(pin, divider)
         self.digital_out_set_divider(pin, divider)
-        # Start HIGH; initial hold = high_ticks (clean first pulse)
-        self.digital_out_set_counter_init(pin, start_high=True, initial_count=high_ticks)
-        self.digital_out_set_counter(pin, low_count=low_ticks, high_count=high_ticks)
+        self.digital_out_set_custom_data(pin, bits)
 
         # --- Global timing --------------------------------------------
         self.digital_out_set_wait_time(delay_s)
-        
-        run_s = (high_time_s + low_time_s) * pulse_count
+
+        # Use the *achieved* (rounded-to-sample) cycle length rather than
+        # the raw requested one, so the run time lines up with exactly
+        # ``pulse_count`` whole cycles of the pattern actually being played.
+        cycle_s = achieved_high_s + achieved_low_s
+        run_s = cycle_s * pulse_count if pulse_count > 0 else 0.0
         self.digital_out_set_run_time(run_s)
 
         self.digital_out_set_repeat(1)
@@ -1827,6 +1946,19 @@ class WaveFormsADS:
         ...     pulse_count=5,
         ...     wait_for_done=True,
         ... )
+
+        Notes
+        -----
+        Each pin gets its own DwfDigitalOutTypeCustom pattern containing
+        exactly one HIGH->LOW cycle (via ``_build_custom_pulse_bits``),
+        sized independently to that pin's requested high/low times, rather
+        than programming DwfDigitalOutTypePulse's shared 32-bit hardware
+        tick-counters. This avoids the precision loss/clamping those
+        counters suffer when a pin's high and low times differ by a large
+        ratio (e.g. a short trigger pulse against a long inter-pulse gap).
+        ``pulse_count`` repeats are applied afterwards via the shared
+        run-time / repeat settings -- each pin's pattern always represents
+        a single cycle.
         """
         n = len(pins)
 
@@ -1849,8 +1981,6 @@ class WaveFormsADS:
         self.digital_out_reset()
 
         clk = self.digital_out_get_internal_clock()
-        MIN_TICKS = 1
-        MAX_COUNT = 0xFFFF_FFFF
 
         max_run_s = 0.0
 
@@ -1858,25 +1988,22 @@ class WaveFormsADS:
             ht = high_times[i]
             lt = low_times[i]
 
-            total_high = max(MIN_TICKS, round(clk * ht))
-            total_low  = max(MIN_TICKS, round(clk * lt))
-            divider = 1
-            while (total_high // divider > MAX_COUNT or
-                   total_low  // divider > MAX_COUNT):
-                divider += 1
-            high_ticks = max(1, round(total_high / divider))
-            low_ticks  = max(1, round(total_low  / divider))
+            max_bits = self.digital_out_get_custom_data_max_bits(pin)
+            divider, bits, achieved_high_s, achieved_low_s = self._build_custom_pulse_bits(
+                ht, lt, clk, max_bits
+            )
+            self._warn_if_pulse_timing_off(pin, ht, lt, achieved_high_s, achieved_low_s)
 
             self.digital_out_enable_channel(pin, True)
             self.digital_out_set_output_mode(pin, out_modes[i])
-            self.digital_out_set_type(pin, DwfDigitalOutTypePulse)
+            self.digital_out_set_type(pin, DwfDigitalOutTypeCustom)
             self.digital_out_set_idle(pin, idles[i])
             self.digital_out_set_divider_init(pin, divider)
             self.digital_out_set_divider(pin, divider)
-            self.digital_out_set_counter_init(pin, start_high=True, initial_count=high_ticks)
-            self.digital_out_set_counter(pin, low_count=low_ticks, high_count=high_ticks)
+            self.digital_out_set_custom_data(pin, bits)
 
-            max_run_s = max(max_run_s, (ht + lt) * pulse_count if pulse_count > 0 else 0.0)
+            cycle_s = achieved_high_s + achieved_low_s
+            max_run_s = max(max_run_s, cycle_s * pulse_count if pulse_count > 0 else 0.0)
 
         # --- Global timing --------------------------------------------
         self.digital_out_set_wait_time(delay_s)
