@@ -640,15 +640,11 @@ class CoreInstrumentApplication(tk.Tk):
 
         # Hardware Trigger Wiring -- populated from whatever GPIO lines and
         # trigger selectors THIS connected camera actually reports
-        # (queried in init_hardware_connections). Different camera models
-        # use different names here ("Line0" / "FrameStart" are common
-        # defaults but not universal), so hardcoding them caused
-        # "no enum entry" errors on cameras that don't expose those exact
-        # names. Falling back to a placeholder list keeps the GUI usable
-        # even if no camera is connected yet.
-        line_options = self.available_trigger_lines or ["Line0"]
+        # (queried in init_hardware_connections). Our camera should use Line6 and
+        # AcquisitionStart to trigger.
+        line_options = self.available_trigger_lines or ["Line6"]
         source_options = self.available_trigger_sources or ["InputLines"]
-        selector_options = self.available_trigger_selectors or ["FrameStart"]
+        selector_options = self.available_trigger_selectors or ["AcquisitionStart"]
 
         self.var_trigger_line = tk.StringVar(value=line_options[0])
         self.var_trigger_source = tk.StringVar(value=source_options[0])
