@@ -97,6 +97,10 @@ class CoreInstrumentApplication(tk.Tk):
         # down any device handles -- see on_app_close() for details.
         self._sequence_running = False
         self._shutdown_waiting_on_sequence = False
+        # Hard cap on how long on_app_close() will wait on a running pulse
+        # sequence before giving up and tearing down hardware anyway. Set
+        # the first time we notice a sequence is in flight during shutdown.
+        self._shutdown_wait_deadline = None
 
         # Persistent canvas image item id for the live view; reused via
         # itemconfig() on every frame instead of stacking a fresh
@@ -127,6 +131,34 @@ class CoreInstrumentApplication(tk.Tk):
         # shutdown routine instead.
         self.protocol("WM_DELETE_WINDOW", self.on_app_close)
 
+    def _run_with_timeout(self, fn, timeout_s, label):
+        """
+        Run fn() on a daemon thread and wait up to timeout_s for it to
+        finish. If it doesn't finish in time, give up waiting and return
+        anyway so shutdown can proceed -- the underlying thread is left
+        running (as a daemon it can't block process exit), but critically
+        this means a single stuck vendor SDK call (VmbPy stop_streaming(),
+        Camera.__exit__(), VmbSystem.__exit__(), etc.) can no longer block
+        every teardown step that comes after it, most importantly the
+        Analog Discovery close() below. Without this, a hang anywhere in
+        the camera teardown chain meant self.ads.close() was never reached
+        at all, which is what previously required an ADS power cycle.
+        """
+        done = threading.Event()
+
+        def _wrapped():
+            try:
+                fn()
+            except Exception as e:
+                print(f"[Shutdown] {label} raised: {e}")
+            finally:
+                done.set()
+
+        threading.Thread(target=_wrapped, daemon=True).start()
+        if not done.wait(timeout=timeout_s):
+            print(f"[Shutdown] {label} did not complete within {timeout_s}s -- "
+                  f"continuing shutdown anyway (likely stuck in a vendor SDK call).")
+
     def on_app_close(self):
         """
         Cleanly release all hardware handles before the window closes.
@@ -148,13 +180,29 @@ class CoreInstrumentApplication(tk.Tk):
         # execution_safeguards clears self._sequence_running). This keeps
         # the GUI responsive rather than blocking, and is bounded because
         # every wait inside the worker thread has its own timeout (5-10 s).
+        #
+        # FIX 2: that per-wait timeout inside the worker is only as good as
+        # the vendor SDK actually honoring it -- if a DWF/VmbPy call hangs
+        # past its own stated timeout, _sequence_running could in principle
+        # never clear and this branch would poll forever. Cap the total
+        # time on_app_close() will wait here so shutdown is always bounded,
+        # even in that worst case; if the deadline passes we give up
+        # waiting and fall through to hardware teardown regardless of
+        # whether the worker thread is technically still running.
         if self._sequence_running:
             if not self._shutdown_waiting_on_sequence:
                 self._shutdown_waiting_on_sequence = True
+                self._shutdown_wait_deadline = time.time() + 15.0
                 print("[Shutdown] Pulse sequence still running -- waiting for it to finish before releasing hardware...")
                 self.title("MOT Control Panel (finishing pulse sequence before closing...)")
-            self.after(150, self.on_app_close)
-            return
+            elif time.time() > self._shutdown_wait_deadline:
+                print("[Shutdown] Pulse sequence wait exceeded 15s -- giving up waiting "
+                      "and forcing hardware teardown anyway.")
+                self._sequence_running = False
+
+            if self._sequence_running:
+                self.after(150, self.on_app_close)
+                return
 
         print("[Shutdown] Close requested -- releasing hardware handles...")
 
@@ -163,26 +211,41 @@ class CoreInstrumentApplication(tk.Tk):
         self.live_view_active = False
 
         # --- Camera ---
+        # FIX 1: every one of these VmbPy calls (stop_streaming(),
+        # Camera.__exit__(), VmbSystem.__exit__() inside camera.close())
+        # is a blocking call into the vendor driver with no host-side
+        # timeout of its own. Previously, if any of them hung (e.g. after
+        # a hardware trigger that never fired), execution never reached
+        # the Analog Discovery teardown below at all, since it runs
+        # strictly after this block finishes -- that's what forced an ADS
+        # power cycle even though the ADS itself wasn't the problem.
+        # Running each step through _run_with_timeout() bounds the total
+        # time this block can take, so the ADS teardown always runs.
         if self.camera is not None:
-            try:
-                self._stop_camera_live_view()
-            except Exception as e:
-                print(f"[Shutdown] Error stopping camera live view: {e}")
-            try:
-                self.camera.close()
-                print("[Shutdown] Camera connection closed.")
-            except Exception as e:
-                print(f"[Shutdown] Error closing camera: {e}")
-            finally:
-                self.camera = None
+            self._run_with_timeout(self._stop_camera_live_view, 3.0, "camera stop_continuous")
+            self._run_with_timeout(self.camera.close, 5.0, "camera.close")
+            self.camera = None
 
         # --- Analog Discovery / WaveForms device ---
         if self.ads is not None:
-            try:
+            def _ads_teardown():
                 # Leave the digital outputs in a known-safe (all-low) state
                 # before tearing down the device handle, rather than
                 # abandoning them mid-pulse if a sequence happened to be
                 # interrupted.
+                try:
+                    # FIX 2: the Digital Out pattern generator (used for the
+                    # DIO1/DIO2 pulse train, and DIO0 too when "Synchronize
+                    # Magnet" is on) was previously never reset on shutdown
+                    # -- only analog_in_reset() was called. If a sequence
+                    # exited abnormally (worker exception, hardware trigger
+                    # timeout, etc.) with the pattern generator still armed,
+                    # closing the device handle on top of that left the ADS
+                    # in a state that needed a power cycle to clear. Reset
+                    # it explicitly here before anything else.
+                    self.ads.digital_out_reset()
+                except Exception:
+                    pass
                 try:
                     self.ads.digital_io_set_output_enable(0x01)
                     self.ads.digital_io_write_pin(pin=0, value=False)
@@ -192,12 +255,10 @@ class CoreInstrumentApplication(tk.Tk):
                     self.ads.analog_in_reset()
                 except Exception:
                     pass
-
                 self.ads.close()
-            except Exception as e:
-                print(f"[Shutdown] Error closing Analog Discovery device: {e}")
-            finally:
-                self.ads = None
+
+            self._run_with_timeout(_ads_teardown, 3.0, "ads teardown")
+            self.ads = None
 
         # Tear down the Tk event loop and window.
         try:
