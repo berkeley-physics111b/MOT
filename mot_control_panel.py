@@ -16,6 +16,7 @@ from waveforms_ads import (
     DwfDigitalOutIdleLow, DwfDigitalOutIdleHigh,
     DwfStateDone,
     trigsrcDigitalOut,
+    funcDC, AnalogOutNodeCarrier,
 )
 from allied_vision_camera import AlliedVisionCamera, CameraConfig, HardwareTriggerConfig, TriggerActivation, TriggerSelector, AcquisitionMode
 
@@ -112,13 +113,38 @@ class CoreInstrumentApplication(tk.Tk):
         self.drag_start_x = 0
         self.drag_start_y = 0
         self.current_rect_id = None
-        
+
+        # --- PID / feedback-loop state (Scope Ch2 error -> WaveGen Ch1) ---
+        # Channel indices in the ADS API are 0-based; the physically
+        # labeled "Ch2" scope input and "Channel 1" AWG output correspond
+        # to indices 1 and 0 respectively.
+        self.SCOPE_ERROR_CHANNEL = 1
+        self.WAVEGEN_MOD_CHANNEL = 0
+        self._pid_integral = 0.0
+        self._pid_last_error = 0.0
+        self._pid_last_time = None
+        self._pid_loop_period_s = 0.005  # ~200 Hz feedback update rate
+        # Signaled on app shutdown so the loop thread stops touching
+        # self.ads before the device handle gets torn down.
+        self._pid_stop_event = threading.Event()
+        self._pid_thread = None
+
         # Connect to Devices Safeguarded against immediate missing hardware
         self.init_hardware_connections()
 
         # Build GUI Frame Panes
         self.create_four_panels()
-        
+
+        # Start the PID feedback-loop background thread. This runs for the
+        # entire lifetime of the app -- not just while its tab happens to
+        # be the one showing -- so the on/off toggle keeps being honored
+        # no matter which tab the user has switched to. It only reads the
+        # tk.Variables built in build_pid_lock_panel() and never touches
+        # any widget directly, which is what makes it safe to run
+        # regardless of tab visibility.
+        self._pid_thread = threading.Thread(target=self._pid_loop_worker, daemon=True)
+        self._pid_thread.start()
+
         # Start Live View Processing Loop
         self.start_live_view()
 
@@ -210,6 +236,15 @@ class CoreInstrumentApplication(tk.Tk):
         # scheduled onto this (soon to be destroyed) Tk main loop.
         self.live_view_active = False
 
+        # --- PID feedback-loop thread ---
+        # Signal the background loop to stop and give it a brief window to
+        # notice, so it isn't still calling into self.ads (analog_in_read_
+        # sample / analog_out_*) while the Analog Discovery handle below is
+        # being closed out from under it.
+        self._pid_stop_event.set()
+        if self._pid_thread is not None:
+            self._pid_thread.join(timeout=1.5)
+
         # --- Camera ---
         # FIX 1: every one of these VmbPy calls (stop_streaming(),
         # Camera.__exit__(), VmbSystem.__exit__() inside camera.close())
@@ -253,6 +288,13 @@ class CoreInstrumentApplication(tk.Tk):
                     pass
                 try:
                     self.ads.analog_in_reset()
+                except Exception:
+                    pass
+                try:
+                    # Leave the PID modulation output in a known-safe
+                    # (disabled, 0 V) state rather than abandoning it at
+                    # whatever correction voltage it last held.
+                    self.ads.analog_out_reset(self.WAVEGEN_MOD_CHANNEL)
                 except Exception:
                     pass
                 self.ads.close()
@@ -350,7 +392,23 @@ class CoreInstrumentApplication(tk.Tk):
         outer vertical PanedWindow also lets the whole top row be shrunk
         relative to the bottom row, and every sash remains user-draggable.
         """
-        self.main_vertical_pane = ttk.PanedWindow(self, orient="vertical")
+        # A Notebook hosts the original 2x2 layout as its first tab, so the
+        # new "PID Lock" tab (Scope Ch2 error -> WaveGen Ch1 modulation)
+        # can sit alongside it without disturbing any of the existing
+        # panel/pane wiring below -- everything is still parented exactly
+        # as before, just one level deeper (inside self.main_tab instead of
+        # directly inside self).
+        self.main_notebook = ttk.Notebook(self)
+        self.main_notebook.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.main_tab = ttk.Frame(self.main_notebook)
+        self.main_notebook.add(self.main_tab, text="Main Control")
+
+        self.pid_tab = ttk.Frame(self.main_notebook)
+        self.main_notebook.add(self.pid_tab, text="PID Lock (Ch2 \u2192 WaveGen Ch1)")
+        self.build_pid_lock_panel(self.pid_tab)
+
+        self.main_vertical_pane = ttk.PanedWindow(self.main_tab, orient="vertical")
         self.main_vertical_pane.pack(fill="both", expand=True, padx=4, pady=4)
 
         self.top_row_pane = ttk.PanedWindow(self.main_vertical_pane, orient="horizontal")
@@ -384,6 +442,193 @@ class CoreInstrumentApplication(tk.Tk):
         self.p_bottom_right = ttk.LabelFrame(self.bottom_row_pane, text="Data Extraction & Background Profiles")
         self.bottom_row_pane.add(self.p_bottom_right, weight=3)
         self.build_bottom_right_panel()
+
+    # =========================================================================
+    # PID LOCK TAB (Scope Ch2 error signal -> WaveGen Ch1 modulation output)
+    # =========================================================================
+
+    def build_pid_lock_panel(self, parent):
+        """
+        Builds the "PID Lock" tab: reads an error signal from ADS Scope
+        Ch2 and drives a G*(P + I + D) correction voltage out on ADS
+        WaveGen Channel 1.
+
+        This method only builds the controls -- the feedback loop itself
+        runs continuously on a background thread started in __init__
+        (see _pid_loop_worker), so the on/off state set here is honored no
+        matter which tab is currently visible. No scope/wavegen trace
+        display is included here by design; a separate scope is used for
+        that.
+        """
+        container = ttk.Frame(parent, padding=12)
+        container.pack(fill="both", expand=True)
+
+        ttk.Label(
+            container, text="Error Signal Feedback Loop", font=("Arial", 13, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(
+            container,
+            text=(
+                "Input: Analog Discovery Scope Ch2 (error signal)\n"
+                "Output: Analog Discovery WaveGen Channel 1 (modulation)\n"
+                "Output is always hard-limited to \u00b15 V, regardless of gain settings."
+            ),
+            foreground="#666666", justify="left",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 14))
+
+        # --- On/off ---
+        self.var_pid_enabled = tk.BooleanVar(value=False)
+        self.btn_pid_toggle = tk.Button(
+            container, text="OUTPUT: OFF", bg="#5f1e1e", fg="white",
+            font=("Arial", 12, "bold"), width=16,
+            command=self.toggle_pid_enabled,
+        )
+        self.btn_pid_toggle.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 14))
+
+        # --- Polarity ---
+        ttk.Label(container, text="Polarity:").grid(row=3, column=0, sticky="w", pady=2)
+        self.var_pid_polarity_inverted = tk.BooleanVar(value=False)
+        polarity_frame = ttk.Frame(container)
+        polarity_frame.grid(row=3, column=1, sticky="w")
+        ttk.Radiobutton(
+            polarity_frame, text="Normal (+)",
+            variable=self.var_pid_polarity_inverted, value=False,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            polarity_frame, text="Inverted (\u2212)",
+            variable=self.var_pid_polarity_inverted, value=True,
+        ).pack(side="left", padx=(10, 0))
+
+        # --- Gain values ---
+        self.var_pid_g = tk.DoubleVar(value=1.0)
+        self.var_pid_p = tk.DoubleVar(value=1.0)
+        self.var_pid_i = tk.DoubleVar(value=0.0)
+        self.var_pid_d = tk.DoubleVar(value=0.0)
+
+        gain_rows = [
+            ("Overall Gain (G):", self.var_pid_g),
+            ("Proportional (P):", self.var_pid_p),
+            ("Integral (I):", self.var_pid_i),
+            ("Derivative (D):", self.var_pid_d),
+        ]
+        for offset, (label_text, var) in enumerate(gain_rows):
+            row = 4 + offset
+            ttk.Label(container, text=label_text).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(container, textvariable=var, width=12).grid(row=row, column=1, sticky="w", pady=2)
+
+        # --- Reset integrator (guards against a stale/wound-up integral
+        # term left over from a previous lock attempt) ---
+        ttk.Button(
+            container, text="Reset Integrator", command=self.reset_pid_integrator,
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(14, 0))
+
+        container.columnconfigure(1, weight=1)
+
+    def toggle_pid_enabled(self):
+        """Flips the PID output on/off and updates the button's appearance."""
+        self.var_pid_enabled.set(not self.var_pid_enabled.get())
+        self._refresh_pid_button_appearance()
+
+    def _refresh_pid_button_appearance(self):
+        if self.var_pid_enabled.get():
+            self.btn_pid_toggle.config(text="OUTPUT: ON", bg="#1e5f2e")
+        else:
+            self.btn_pid_toggle.config(text="OUTPUT: OFF", bg="#5f1e1e")
+
+    def reset_pid_integrator(self):
+        """Zeroes the integral/derivative history without touching the on/off state."""
+        self._pid_integral = 0.0
+        self._pid_last_error = 0.0
+        self._pid_last_time = None
+
+    def _pid_arm_wavegen_channel(self):
+        """Claims the WaveGen modulation channel and starts it at 0 V."""
+        ch = self.WAVEGEN_MOD_CHANNEL
+        self.ads.analog_out_reset(ch)
+        self.ads.analog_out_enable_node(ch, AnalogOutNodeCarrier, 1)
+        self.ads.analog_out_set_function(ch, funcDC)
+        self.ads.analog_out_set_offset(ch, 0.0)
+        self.ads.analog_out_start(ch)
+
+    def _pid_disarm_wavegen_channel(self):
+        """Forces the modulation output back to 0 V and stops the generator."""
+        ch = self.WAVEGEN_MOD_CHANNEL
+        try:
+            self.ads.analog_out_set_offset(ch, 0.0)
+            self.ads.analog_out_start(ch)  # push the 0 V update before stopping
+            self.ads.analog_out_stop(ch)
+        except Exception as e:
+            print(f"[PID Lock] Could not disarm WaveGen channel cleanly: {e}")
+
+    def _set_pid_wavegen_output(self, voltage_v):
+        """Updates the live modulation output voltage (already clamped by the caller)."""
+        ch = self.WAVEGEN_MOD_CHANNEL
+        self.ads.analog_out_set_offset(ch, voltage_v)
+        self.ads.analog_out_start(ch)
+
+    def _pid_step(self):
+        """Runs a single G*(P + I + D) update from the Ch2 error signal."""
+        now = time.perf_counter()
+        dt = (now - self._pid_last_time) if self._pid_last_time is not None else 0.0
+        self._pid_last_time = now
+
+        raw_error_v = self.ads.analog_in_read_sample(channel=self.SCOPE_ERROR_CHANNEL)
+        sign = -1.0 if self.var_pid_polarity_inverted.get() else 1.0
+        error = sign * raw_error_v
+
+        g_gain = self.var_pid_g.get()
+        p_gain = self.var_pid_p.get()
+        i_gain = self.var_pid_i.get()
+        d_gain = self.var_pid_d.get()
+
+        derivative = ((error - self._pid_last_error) / dt) if dt > 0 else 0.0
+        trial_integral = self._pid_integral + (error * dt if dt > 0 else 0.0)
+
+        raw_output = g_gain * (p_gain * error + i_gain * trial_integral + d_gain * derivative)
+        output = max(-5.0, min(5.0, raw_output))
+
+        # Simple clamped-integrator anti-windup: only fold the new integral
+        # term in if doing so didn't require clipping the output. This
+        # keeps a long-saturated error from leaving behind a huge integral
+        # that then overshoots wildly once the loop recovers.
+        if raw_output == output:
+            self._pid_integral = trial_integral
+
+        self._pid_last_error = error
+        self._set_pid_wavegen_output(output)
+
+    def _pid_loop_worker(self):
+        """
+        Background feedback-loop thread. Runs for the entire lifetime of
+        the application (started once in __init__, stopped in
+        on_app_close), independent of which GUI tab happens to be showing
+        -- it only ever reads the tk.Variables built in
+        build_pid_lock_panel() and never touches a widget directly, so
+        switching tabs has no effect on whether it keeps running.
+        """
+        prev_enabled = False
+        while not self._pid_stop_event.is_set():
+            try:
+                enabled = bool(self.var_pid_enabled.get()) and self.ads is not None
+
+                if enabled and not prev_enabled:
+                    # Rising edge: (re)claim the AWG channel and clear the
+                    # integrator so a stale accumulation from a previous
+                    # run doesn't cause a jump the moment the loop re-arms.
+                    self._pid_integral = 0.0
+                    self._pid_last_error = 0.0
+                    self._pid_last_time = None
+                    self._pid_arm_wavegen_channel()
+                elif not enabled and prev_enabled:
+                    # Falling edge: force the modulation output back to 0 V.
+                    self._pid_disarm_wavegen_channel()
+                prev_enabled = enabled
+
+                if enabled:
+                    self._pid_step()
+            except Exception as e:
+                print(f"[PID Loop Error] {e}")
+            time.sleep(self._pid_loop_period_s)
 
     # =========================================================================
     # PANEL BUILDERS & LOGIC SECTIONS
