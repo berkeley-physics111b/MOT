@@ -114,20 +114,62 @@ class CoreInstrumentApplication(tk.Tk):
         self.drag_start_y = 0
         self.current_rect_id = None
 
-        # --- PID / feedback-loop state (Scope Ch2 error -> WaveGen Ch1) ---
+        # --- Laser Lock tab state (ADS Scope Ch1/Ch2 -> WaveGen Ch1) ---
         # Channel indices in the ADS API are 0-based; the physically
-        # labeled "Ch2" scope input and "Channel 1" AWG output correspond
-        # to indices 1 and 0 respectively.
-        self.SCOPE_ERROR_CHANNEL = 1
+        # labeled "Ch1"/"Ch2" scope inputs and "Channel 1" AWG output
+        # correspond to indices 0, 1, and 0 respectively.
+        #   Scope Ch1 (index 0) = PD2, plain fluorescence/absorption signal.
+        #   Scope Ch2 (index 1) = PD1b - PD1a, DAVLL error signal.
+        #   WaveGen Ch1 (index 0) = laser modulation output (sweep + offset
+        #   + internal bias + feedback, summed -- see _laser_lock_step).
+        self.SCOPE_CH1_FLUOR = 0
+        self.SCOPE_CH2_ERROR = 1
         self.WAVEGEN_MOD_CHANNEL = 0
+
+        # Live scope readings, written only by the background loop thread
+        # and read only by the polling GUI refresh callback below -- a
+        # plain float/None assignment is atomic under the GIL, so no extra
+        # locking is needed for this single-writer/single-reader pattern.
+        # Ch1 is forced back to None whenever the lock is engaged, since
+        # this tab stops sampling that channel while locked (freeing it up
+        # for the other MOT tab that also needs it -- see _laser_lock_step).
+        self._last_scope_ch1_v = None
+        self._last_scope_ch2_v = None
+        self._last_wavegen_out_v = 0.0
+
+        # Ch2 (DAVLL error) low-pass filter state: a single-pole IIR
+        # applied every loop iteration using the actual measured dt.
+        # NOTE: a true 100 kHz analog cutoff cannot actually be realized
+        # by polling single USB samples at the loop rates achievable here
+        # (low kHz at best) -- dt will always be >> the 100 kHz filter's
+        # time constant (~1.6 us), so in practice this filter passes the
+        # signal through almost unfiltered. The math is correct for
+        # whatever dt is measured (and will behave properly if this is
+        # ever driven from a faster/streamed acquisition path), but real
+        # 100 kHz-bandwidth noise rejection would need actual analog
+        # filtering ahead of the ADC, not a software filter on
+        # USB-polled samples.
+        self.ERROR_LOWPASS_CUTOFF_HZ = 100_000.0
+        self._error_lpf_state = 0.0
+
+        # PID state -- operates on the low-pass-filtered, bias-shifted
+        # error signal (see _laser_lock_step).
         self._pid_integral = 0.0
         self._pid_last_error = 0.0
         self._pid_last_time = None
-        self._pid_loop_period_s = 0.005  # ~200 Hz feedback update rate
+
+        # Reference time base for the software-generated sweep waveform.
+        self._sweep_t0 = time.perf_counter()
+
+        self._laser_lock_loop_period_s = 0.002  # best-effort ~500 Hz update rate
         # Signaled on app shutdown so the loop thread stops touching
         # self.ads before the device handle gets torn down.
-        self._pid_stop_event = threading.Event()
-        self._pid_thread = None
+        self._lock_stop_event = threading.Event()
+        self._lock_thread = None
+        # Cleared on app shutdown so the GUI-refresh self.after() chain
+        # stops rescheduling itself against widgets that are about to be
+        # destroyed.
+        self._laser_lock_gui_alive = True
 
         # Connect to Devices Safeguarded against immediate missing hardware
         self.init_hardware_connections()
@@ -135,15 +177,21 @@ class CoreInstrumentApplication(tk.Tk):
         # Build GUI Frame Panes
         self.create_four_panels()
 
-        # Start the PID feedback-loop background thread. This runs for the
-        # entire lifetime of the app -- not just while its tab happens to
-        # be the one showing -- so the on/off toggle keeps being honored
+        # Start the Laser Lock feedback-loop background thread. This runs
+        # for the entire lifetime of the app -- not just while its tab
+        # happens to be the one showing -- so the sweep/lock keeps running
         # no matter which tab the user has switched to. It only reads the
-        # tk.Variables built in build_pid_lock_panel() and never touches
+        # tk.Variables built in build_laser_lock_panel() and never touches
         # any widget directly, which is what makes it safe to run
         # regardless of tab visibility.
-        self._pid_thread = threading.Thread(target=self._pid_loop_worker, daemon=True)
-        self._pid_thread.start()
+        self._lock_thread = threading.Thread(target=self._laser_lock_loop_worker, daemon=True)
+        self._lock_thread.start()
+
+        # Low-rate GUI refresh for the Scope Ch1/Ch2 live readouts. This
+        # runs on the main thread via self.after and only ever touches Tk
+        # widgets/variables -- it never talks to self.ads directly, so it
+        # can't race with the background loop thread above.
+        self.after(150, self._laser_lock_refresh_display)
 
         # Start Live View Processing Loop
         self.start_live_view()
@@ -236,14 +284,17 @@ class CoreInstrumentApplication(tk.Tk):
         # scheduled onto this (soon to be destroyed) Tk main loop.
         self.live_view_active = False
 
-        # --- PID feedback-loop thread ---
+        # --- Laser Lock feedback-loop thread ---
         # Signal the background loop to stop and give it a brief window to
         # notice, so it isn't still calling into self.ads (analog_in_read_
         # sample / analog_out_*) while the Analog Discovery handle below is
-        # being closed out from under it.
-        self._pid_stop_event.set()
-        if self._pid_thread is not None:
-            self._pid_thread.join(timeout=1.5)
+        # being closed out from under it. Also stop the GUI-refresh
+        # self.after() chain so it doesn't reschedule itself against
+        # widgets that are about to be destroyed.
+        self._laser_lock_gui_alive = False
+        self._lock_stop_event.set()
+        if self._lock_thread is not None:
+            self._lock_thread.join(timeout=1.5)
 
         # --- Camera ---
         # FIX 1: every one of these VmbPy calls (stop_streaming(),
@@ -404,9 +455,9 @@ class CoreInstrumentApplication(tk.Tk):
         self.main_tab = ttk.Frame(self.main_notebook)
         self.main_notebook.add(self.main_tab, text="Main Control")
 
-        self.pid_tab = ttk.Frame(self.main_notebook)
-        self.main_notebook.add(self.pid_tab, text="PID Lock (Ch2 \u2192 WaveGen Ch1)")
-        self.build_pid_lock_panel(self.pid_tab)
+        self.laser_lock_tab = ttk.Frame(self.main_notebook)
+        self.main_notebook.add(self.laser_lock_tab, text="Laser Lock (Scope Ch1/Ch2 \u2192 WaveGen Ch1)")
+        self.build_laser_lock_panel(self.laser_lock_tab)
 
         self.main_vertical_pane = ttk.PanedWindow(self.main_tab, orient="vertical")
         self.main_vertical_pane.pack(fill="both", expand=True, padx=4, pady=4)
@@ -444,52 +495,111 @@ class CoreInstrumentApplication(tk.Tk):
         self.build_bottom_right_panel()
 
     # =========================================================================
-    # PID LOCK TAB (Scope Ch2 error signal -> WaveGen Ch1 modulation output)
+    # LASER LOCK TAB (Scope Ch1 = PD2 fluorescence [display only],
+    # Ch2 = DAVLL error -> WaveGen Ch1 modulation = sweep + offset +
+    # internal bias + PID feedback, summed)
     # =========================================================================
 
-    def build_pid_lock_panel(self, parent):
+    def build_laser_lock_panel(self, parent):
         """
-        Builds the "PID Lock" tab: reads an error signal from ADS Scope
-        Ch2 and drives a G*(P + I + D) correction voltage out on ADS
-        WaveGen Channel 1.
+        Builds the "Laser Lock" tab.
+
+        Signal chain (see _laser_lock_step for the exact implementation):
+            Scope Ch2 (DAVLL error) --lowpass(100 kHz)--> (+) internal bias
+                --> PID controller --> (+) sweep --> (+) offset
+                --> clamp to +/-5 V --> WaveGen Ch1 (laser modulation)
+
+        Scope Ch1 (PD2, plain fluorescence/absorption) is display-only and
+        is never fed into the loop. It's read and shown while the lock is
+        OFF; once the lock is engaged this tab stops sampling it entirely
+        so it's free for the other MOT tab that also needs it.
 
         This method only builds the controls -- the feedback loop itself
-        runs continuously on a background thread started in __init__
-        (see _pid_loop_worker), so the on/off state set here is honored no
-        matter which tab is currently visible. No scope/wavegen trace
-        display is included here by design; a separate scope is used for
-        that.
+        runs continuously on a background thread started in __init__ (see
+        _laser_lock_loop_worker), so sweep/lock state is honored no matter
+        which tab is currently visible.
         """
         container = ttk.Frame(parent, padding=12)
         container.pack(fill="both", expand=True)
 
         ttk.Label(
-            container, text="Error Signal Feedback Loop", font=("Arial", 13, "bold"),
+            container, text="Laser Lock", font=("Arial", 13, "bold"),
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
         ttk.Label(
             container,
             text=(
-                "Input: Analog Discovery Scope Ch2 (error signal)\n"
-                "Output: Analog Discovery WaveGen Channel 1 (modulation)\n"
-                "Output is always hard-limited to \u00b15 V, regardless of gain settings."
+                "Inputs:  Scope Ch1 = PD2 (fluorescence/absorption, display only)\n"
+                "         Scope Ch2 = PD1b \u2212 PD1a (DAVLL error signal)\n"
+                "Output:  WaveGen Channel 1 = sweep + offset + PID feedback\n"
+                "         (feedback acts on lowpass(Ch2) + internal bias)\n"
+                "Output is always hard-limited to \u00b15 V, regardless of gain settings.\n"
+                "Engaging the lock turns the sweep OFF and the PID feedback ON."
             ),
             foreground="#666666", justify="left",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 14))
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
-        # --- On/off ---
-        self.var_pid_enabled = tk.BooleanVar(value=False)
-        self.btn_pid_toggle = tk.Button(
-            container, text="OUTPUT: OFF", bg="#5f1e1e", fg="white",
-            font=("Arial", 12, "bold"), width=16,
-            command=self.toggle_pid_enabled,
+        # --- Live scope / output readouts ---
+        readout_frame = ttk.LabelFrame(container, text="Live Readouts")
+        readout_frame.grid(row=2, column=0, columnspan=2, sticky="we", pady=(0, 12))
+        self.var_scope_ch1_display = tk.StringVar(value="\u2014")
+        self.var_scope_ch2_display = tk.StringVar(value="\u2014")
+        self.var_wavegen_out_display = tk.StringVar(value="\u2014")
+        ttk.Label(readout_frame, text="Scope Ch1 (PD2):").grid(row=0, column=0, sticky="w", padx=6, pady=3)
+        ttk.Label(readout_frame, textvariable=self.var_scope_ch1_display, font=("Consolas", 11)).grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(readout_frame, text="Scope Ch2 (DAVLL error):").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        ttk.Label(readout_frame, textvariable=self.var_scope_ch2_display, font=("Consolas", 11)).grid(row=1, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(readout_frame, text="WaveGen Ch1 output:").grid(row=2, column=0, sticky="w", padx=6, pady=3)
+        ttk.Label(readout_frame, textvariable=self.var_wavegen_out_display, font=("Consolas", 11)).grid(row=2, column=1, sticky="w", padx=6, pady=3)
+
+        # --- Lock on/off ---
+        self.var_lock_enabled = tk.BooleanVar(value=False)
+        self.btn_lock_toggle = tk.Button(
+            container, text="LOCK: OFF (sweeping)", bg="#5f1e1e", fg="white",
+            font=("Arial", 12, "bold"), width=22,
+            command=self.toggle_lock_enabled,
         )
-        self.btn_pid_toggle.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 14))
+        self.btn_lock_toggle.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 14))
 
-        # --- Polarity ---
-        ttk.Label(container, text="Polarity:").grid(row=3, column=0, sticky="w", pady=2)
+        # --- Sweep controls (active while unlocked) ---
+        sweep_frame = ttk.LabelFrame(container, text="Sweep (active while unlocked)")
+        sweep_frame.grid(row=4, column=0, columnspan=2, sticky="we", pady=(0, 10))
+        self.var_sweep_freq_hz = tk.DoubleVar(value=10.0)
+        self.var_sweep_amp_v = tk.DoubleVar(value=0.0)
+        ttk.Label(sweep_frame, text="Frequency (Hz):").grid(row=0, column=0, sticky="w", padx=6, pady=3)
+        ttk.Entry(sweep_frame, textvariable=self.var_sweep_freq_hz, width=12).grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(sweep_frame, text="Amplitude (V, peak):").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        ttk.Entry(sweep_frame, textvariable=self.var_sweep_amp_v, width=12).grid(row=1, column=1, sticky="w", padx=6, pady=3)
+
+        # --- Offset (slider + numeric entry, mV) ---
+        offset_frame = ttk.LabelFrame(container, text="Offset (mV) \u2014 compensates for sweep being off")
+        offset_frame.grid(row=5, column=0, columnspan=2, sticky="we", pady=(0, 10))
+        self.var_offset_mv = tk.DoubleVar(value=0.0)
+        tk.Scale(
+            offset_frame, from_=-5000, to=5000, resolution=1, orient="horizontal",
+            variable=self.var_offset_mv, length=320, showvalue=False,
+        ).grid(row=0, column=0, sticky="we", padx=6, pady=3)
+        ttk.Entry(offset_frame, textvariable=self.var_offset_mv, width=10).grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        offset_frame.columnconfigure(0, weight=1)
+
+        # --- Internal bias (slider + numeric entry, mV) ---
+        bias_frame = ttk.LabelFrame(container, text="Internal Bias (mV) \u2014 shifts the PID's lock point, live-adjustable")
+        bias_frame.grid(row=6, column=0, columnspan=2, sticky="we", pady=(0, 10))
+        self.var_bias_mv = tk.DoubleVar(value=0.0)
+        tk.Scale(
+            bias_frame, from_=-5000, to=5000, resolution=1, orient="horizontal",
+            variable=self.var_bias_mv, length=320, showvalue=False,
+        ).grid(row=0, column=0, sticky="we", padx=6, pady=3)
+        ttk.Entry(bias_frame, textvariable=self.var_bias_mv, width=10).grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        bias_frame.columnconfigure(0, weight=1)
+
+        # --- PID controls ---
+        pid_frame = ttk.LabelFrame(container, text="PID (acts on lowpass(Ch2) + bias)")
+        pid_frame.grid(row=7, column=0, columnspan=2, sticky="we", pady=(0, 10))
+
+        ttk.Label(pid_frame, text="Polarity:").grid(row=0, column=0, sticky="w", padx=6, pady=2)
         self.var_pid_polarity_inverted = tk.BooleanVar(value=False)
-        polarity_frame = ttk.Frame(container)
-        polarity_frame.grid(row=3, column=1, sticky="w")
+        polarity_frame = ttk.Frame(pid_frame)
+        polarity_frame.grid(row=0, column=1, sticky="w")
         ttk.Radiobutton(
             polarity_frame, text="Normal (+)",
             variable=self.var_pid_polarity_inverted, value=False,
@@ -499,7 +609,6 @@ class CoreInstrumentApplication(tk.Tk):
             variable=self.var_pid_polarity_inverted, value=True,
         ).pack(side="left", padx=(10, 0))
 
-        # --- Gain values ---
         self.var_pid_g = tk.DoubleVar(value=1.0)
         self.var_pid_p = tk.DoubleVar(value=1.0)
         self.var_pid_i = tk.DoubleVar(value=0.0)
@@ -512,36 +621,36 @@ class CoreInstrumentApplication(tk.Tk):
             ("Derivative (D):", self.var_pid_d),
         ]
         for offset, (label_text, var) in enumerate(gain_rows):
-            row = 4 + offset
-            ttk.Label(container, text=label_text).grid(row=row, column=0, sticky="w", pady=2)
-            ttk.Entry(container, textvariable=var, width=12).grid(row=row, column=1, sticky="w", pady=2)
+            row = 1 + offset
+            ttk.Label(pid_frame, text=label_text).grid(row=row, column=0, sticky="w", padx=6, pady=2)
+            ttk.Entry(pid_frame, textvariable=var, width=12).grid(row=row, column=1, sticky="w", padx=6, pady=2)
 
         # --- Reset integrator (guards against a stale/wound-up integral
         # term left over from a previous lock attempt) ---
         ttk.Button(
-            container, text="Reset Integrator", command=self.reset_pid_integrator,
-        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(14, 0))
+            pid_frame, text="Reset Integrator", command=self.reset_pid_integrator,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(8, 4))
 
         container.columnconfigure(1, weight=1)
 
-    def toggle_pid_enabled(self):
-        """Flips the PID output on/off and updates the button's appearance."""
-        self.var_pid_enabled.set(not self.var_pid_enabled.get())
-        self._refresh_pid_button_appearance()
+    def toggle_lock_enabled(self):
+        """Flips the lock on/off and updates the button's appearance."""
+        self.var_lock_enabled.set(not self.var_lock_enabled.get())
+        self._refresh_lock_button_appearance()
 
-    def _refresh_pid_button_appearance(self):
-        if self.var_pid_enabled.get():
-            self.btn_pid_toggle.config(text="OUTPUT: ON", bg="#1e5f2e")
+    def _refresh_lock_button_appearance(self):
+        if self.var_lock_enabled.get():
+            self.btn_lock_toggle.config(text="LOCK: ON (feedback)", bg="#1e5f2e")
         else:
-            self.btn_pid_toggle.config(text="OUTPUT: OFF", bg="#5f1e1e")
+            self.btn_lock_toggle.config(text="LOCK: OFF (sweeping)", bg="#5f1e1e")
 
     def reset_pid_integrator(self):
-        """Zeroes the integral/derivative history without touching the on/off state."""
+        """Zeroes the integral/derivative history without touching the lock state."""
         self._pid_integral = 0.0
         self._pid_last_error = 0.0
         self._pid_last_time = None
 
-    def _pid_arm_wavegen_channel(self):
+    def _laser_lock_arm_wavegen_channel(self):
         """Claims the WaveGen modulation channel and starts it at 0 V."""
         ch = self.WAVEGEN_MOD_CHANNEL
         self.ads.analog_out_reset(ch)
@@ -550,7 +659,7 @@ class CoreInstrumentApplication(tk.Tk):
         self.ads.analog_out_set_offset(ch, 0.0)
         self.ads.analog_out_start(ch)
 
-    def _pid_disarm_wavegen_channel(self):
+    def _laser_lock_disarm_wavegen_channel(self):
         """Forces the modulation output back to 0 V and stops the generator."""
         ch = self.WAVEGEN_MOD_CHANNEL
         try:
@@ -558,77 +667,181 @@ class CoreInstrumentApplication(tk.Tk):
             self.ads.analog_out_start(ch)  # push the 0 V update before stopping
             self.ads.analog_out_stop(ch)
         except Exception as e:
-            print(f"[PID Lock] Could not disarm WaveGen channel cleanly: {e}")
+            print(f"[Laser Lock] Could not disarm WaveGen channel cleanly: {e}")
 
-    def _set_pid_wavegen_output(self, voltage_v):
+    def _set_laser_lock_wavegen_output(self, voltage_v):
         """Updates the live modulation output voltage (already clamped by the caller)."""
         ch = self.WAVEGEN_MOD_CHANNEL
         self.ads.analog_out_set_offset(ch, voltage_v)
         self.ads.analog_out_start(ch)
+        self._last_wavegen_out_v = voltage_v
 
-    def _pid_step(self):
-        """Runs a single G*(P + I + D) update from the Ch2 error signal."""
-        now = time.perf_counter()
+    def _sweep_value_v(self, now):
+        """
+        Software-generated symmetric triangle wave, amplitude/frequency
+        taken live from the GUI. Uses an absolute time base so changing
+        frequency/amplitude on the fly doesn't require any extra state --
+        a frequency change just produces a phase discontinuity, the same
+        as retuning a hardware function generator.
+        """
+        freq_hz = self.var_sweep_freq_hz.get()
+        amp_v = self.var_sweep_amp_v.get()
+        if freq_hz <= 0:
+            return 0.0
+        phase = (now - self._sweep_t0) * freq_hz
+        frac = phase - np.floor(phase)
+        tri = 2.0 * abs(2.0 * (frac - np.floor(frac + 0.5))) - 1.0  # triangle in [-1, 1]
+        return float(amp_v * tri)
+
+    def _laser_lock_step(self, now, locked):
+        """
+        Runs a single iteration of the full signal chain and writes the
+        result out to WaveGen Ch1:
+
+            Scope Ch2 (error) --lowpass(100 kHz)--> (+) internal bias
+                --> PID --> (+) sweep --> (+) offset --> clamp(+/-5V) --> out
+
+        Ch1 (PD2) is only sampled/displayed while unlocked -- see the
+        class docstring / build_laser_lock_panel for why.
+        """
         dt = (now - self._pid_last_time) if self._pid_last_time is not None else 0.0
         self._pid_last_time = now
 
-        raw_error_v = self.ads.analog_in_read_sample(channel=self.SCOPE_ERROR_CHANNEL)
+        # --- Ch1 (PD2), display-only, skipped entirely while locked ---
+        if not locked:
+            try:
+                self._last_scope_ch1_v = self.ads.analog_in_read_sample(channel=self.SCOPE_CH1_FLUOR)
+            except Exception:
+                self._last_scope_ch1_v = None
+        else:
+            self._last_scope_ch1_v = None
+
+        # --- Ch2 (DAVLL error): read, apply polarity, lowpass filter ---
+        raw_error_v = self.ads.analog_in_read_sample(channel=self.SCOPE_CH2_ERROR)
+        self._last_scope_ch2_v = raw_error_v
         sign = -1.0 if self.var_pid_polarity_inverted.get() else 1.0
         error = sign * raw_error_v
 
+        # Single-pole IIR lowpass, cutoff = ERROR_LOWPASS_CUTOFF_HZ, using
+        # the actually-measured dt (see the note in __init__ about why
+        # this can't realize a literal 100 kHz cutoff at USB polling rates).
+        if dt > 0:
+            rc = 1.0 / (2.0 * np.pi * self.ERROR_LOWPASS_CUTOFF_HZ)
+            alpha = dt / (dt + rc)
+        else:
+            alpha = 1.0
+        self._error_lpf_state += alpha * (error - self._error_lpf_state)
+        error_filtered = self._error_lpf_state
+
+        # --- Internal bias shifts the PID's zero; live-adjustable ---
+        bias_v = self.var_bias_mv.get() / 1000.0
+        error_biased = error_filtered + bias_v
+
+        # --- PID ---
         g_gain = self.var_pid_g.get()
         p_gain = self.var_pid_p.get()
         i_gain = self.var_pid_i.get()
         d_gain = self.var_pid_d.get()
 
-        derivative = ((error - self._pid_last_error) / dt) if dt > 0 else 0.0
-        trial_integral = self._pid_integral + (error * dt if dt > 0 else 0.0)
+        derivative = ((error_biased - self._pid_last_error) / dt) if dt > 0 else 0.0
+        trial_integral = self._pid_integral + (error_biased * dt if dt > 0 else 0.0)
+        pid_raw = g_gain * (p_gain * error_biased + i_gain * trial_integral + d_gain * derivative)
+        self._pid_last_error = error_biased
 
-        raw_output = g_gain * (p_gain * error + i_gain * trial_integral + d_gain * derivative)
-        output = max(-5.0, min(5.0, raw_output))
+        # --- Sum: feedback (locked) or sweep (unlocked), plus offset ---
+        offset_v = self.var_offset_mv.get() / 1000.0
+        if locked:
+            feedback_term = pid_raw
+            sweep_term = 0.0
+        else:
+            feedback_term = 0.0
+            sweep_term = self._sweep_value_v(now)
+
+        raw_sum = feedback_term + sweep_term + offset_v
+        output = max(-5.0, min(5.0, raw_sum))
 
         # Simple clamped-integrator anti-windup: only fold the new integral
-        # term in if doing so didn't require clipping the output. This
-        # keeps a long-saturated error from leaving behind a huge integral
-        # that then overshoots wildly once the loop recovers.
-        if raw_output == output:
+        # term in (and only while locked) if doing so didn't require
+        # clipping the output. This keeps a long-saturated error from
+        # leaving behind a huge integral that then overshoots wildly once
+        # the loop recovers, and keeps the integrator from accumulating at
+        # all while unlocked (it's reset on re-lock anyway, see below).
+        if locked and raw_sum == output:
             self._pid_integral = trial_integral
 
-        self._pid_last_error = error
-        self._set_pid_wavegen_output(output)
+        self._set_laser_lock_wavegen_output(output)
 
-    def _pid_loop_worker(self):
+    def _laser_lock_loop_worker(self):
         """
         Background feedback-loop thread. Runs for the entire lifetime of
         the application (started once in __init__, stopped in
         on_app_close), independent of which GUI tab happens to be showing
         -- it only ever reads the tk.Variables built in
-        build_pid_lock_panel() and never touches a widget directly, so
+        build_laser_lock_panel() and never touches a widget directly, so
         switching tabs has no effect on whether it keeps running.
+
+        Unlike the old PID-only tab, the WaveGen channel is armed as soon
+        as the ADS is available and stays armed continuously -- the tab
+        sweeps by default (amplitude 0 V until the user dials one in) and
+        switches to PID feedback only while locked, rather than sitting
+        idle at 0 V until a button is pressed.
         """
-        prev_enabled = False
-        while not self._pid_stop_event.is_set():
+        armed = False
+        prev_locked = False
+        while not self._lock_stop_event.is_set():
             try:
-                enabled = bool(self.var_pid_enabled.get()) and self.ads is not None
+                if self.ads is not None and not armed:
+                    self._laser_lock_arm_wavegen_channel()
+                    armed = True
 
-                if enabled and not prev_enabled:
-                    # Rising edge: (re)claim the AWG channel and clear the
-                    # integrator so a stale accumulation from a previous
-                    # run doesn't cause a jump the moment the loop re-arms.
-                    self._pid_integral = 0.0
-                    self._pid_last_error = 0.0
-                    self._pid_last_time = None
-                    self._pid_arm_wavegen_channel()
-                elif not enabled and prev_enabled:
-                    # Falling edge: force the modulation output back to 0 V.
-                    self._pid_disarm_wavegen_channel()
-                prev_enabled = enabled
+                if armed:
+                    locked = bool(self.var_lock_enabled.get())
 
-                if enabled:
-                    self._pid_step()
+                    if locked and not prev_locked:
+                        # Rising edge: clear the integrator so a stale
+                        # accumulation from a previous lock attempt
+                        # doesn't cause a jump the moment it re-engages.
+                        self._pid_integral = 0.0
+                        self._pid_last_error = 0.0
+                    prev_locked = locked
+
+                    self._laser_lock_step(time.perf_counter(), locked)
             except Exception as e:
-                print(f"[PID Loop Error] {e}")
-            time.sleep(self._pid_loop_period_s)
+                print(f"[Laser Lock Loop Error] {e}")
+            time.sleep(self._laser_lock_loop_period_s)
+
+        # Loop is exiting (app shutdown) -- leave the output at a known-
+        # safe 0 V rather than abandoning it wherever it last was.
+        if armed and self.ads is not None:
+            self._laser_lock_disarm_wavegen_channel()
+
+    def _laser_lock_refresh_display(self):
+        """
+        Low-rate (~7 Hz) GUI refresh for the Scope Ch1/Ch2 and WaveGen Ch1
+        live readouts. Runs on the main thread via self.after and only
+        ever reads the plain float/None attributes written by the
+        background loop thread -- it never touches self.ads directly, so
+        it can't race with that thread.
+        """
+        if not getattr(self, "_laser_lock_gui_alive", False):
+            return
+        try:
+            if self._last_scope_ch1_v is None:
+                self.var_scope_ch1_display.set(
+                    "\u2014 (not sampled while locked)" if self.var_lock_enabled.get() else "\u2014"
+                )
+            else:
+                self.var_scope_ch1_display.set(f"{self._last_scope_ch1_v:+.4f} V")
+
+            if self._last_scope_ch2_v is None:
+                self.var_scope_ch2_display.set("\u2014")
+            else:
+                self.var_scope_ch2_display.set(f"{self._last_scope_ch2_v:+.4f} V")
+
+            self.var_wavegen_out_display.set(f"{self._last_wavegen_out_v:+.4f} V")
+        except Exception:
+            pass
+        self.after(150, self._laser_lock_refresh_display)
 
     # =========================================================================
     # PANEL BUILDERS & LOGIC SECTIONS
