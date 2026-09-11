@@ -1,9 +1,9 @@
 import os
 import csv
 import time
-import ctypes
 import logging
 import threading
+from collections import deque
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import numpy as np
@@ -135,25 +135,18 @@ class CoreInstrumentApplication(tk.Tk):
         # for the other MOT tab that also needs it -- see _laser_lock_step).
         self._last_scope_ch1_v = None
         self._last_scope_ch2_v = None
-        self._last_wavegen_out_v = 0.0
 
-        # Ch2 (DAVLL error) low-pass filter state: a single-pole IIR
-        # applied every loop iteration using the actual measured dt.
-        # NOTE: a true 100 kHz analog cutoff cannot actually be realized
-        # by polling single USB samples at the loop rates achievable here
-        # (low kHz at best) -- dt will always be >> the 100 kHz filter's
-        # time constant (~1.6 us), so in practice this filter passes the
-        # signal through almost unfiltered. The math is correct for
-        # whatever dt is measured (and will behave properly if this is
-        # ever driven from a faster/streamed acquisition path), but real
-        # 100 kHz-bandwidth noise rejection would need actual analog
-        # filtering ahead of the ADC, not a software filter on
-        # USB-polled samples.
-        self.ERROR_LOWPASS_CUTOFF_HZ = 100_000.0
-        self._error_lpf_state = 0.0
+        # Rolling (t, v) trace buffers behind the Ch1/Ch2 plots. Appended
+        # to only by the background loop thread; the GUI refresh callback
+        # only ever reads a list() snapshot of these for drawing, so it
+        # can't be corrupted by a concurrent append (deque.append is
+        # atomic under the GIL).
+        self.SCOPE_TRACE_MAXLEN = 500
+        self._scope_ch1_trace = deque(maxlen=self.SCOPE_TRACE_MAXLEN)
+        self._scope_ch2_trace = deque(maxlen=self.SCOPE_TRACE_MAXLEN)
 
-        # PID state -- operates on the low-pass-filtered, bias-shifted
-        # error signal (see _laser_lock_step).
+        # PID state -- operates on the bias-shifted Ch2 error signal (see
+        # _laser_lock_step).
         self._pid_integral = 0.0
         self._pid_last_error = 0.0
         self._pid_last_time = None
@@ -505,9 +498,9 @@ class CoreInstrumentApplication(tk.Tk):
         Builds the "Laser Lock" tab.
 
         Signal chain (see _laser_lock_step for the exact implementation):
-            Scope Ch2 (DAVLL error) --lowpass(100 kHz)--> (+) internal bias
-                --> PID controller --> (+) sweep --> (+) offset
-                --> clamp to +/-5 V --> WaveGen Ch1 (laser modulation)
+            Scope Ch2 (DAVLL error) --> (+) internal bias --> PID controller
+                --> (+) sweep --> (+) offset --> clamp to +/-5 V
+                --> WaveGen Ch1 (laser modulation)
 
         Scope Ch1 (PD2, plain fluorescence/absorption) is display-only and
         is never fed into the loop. It's read and shown while the lock is
@@ -531,7 +524,7 @@ class CoreInstrumentApplication(tk.Tk):
                 "Inputs:  Scope Ch1 = PD2 (fluorescence/absorption, display only)\n"
                 "         Scope Ch2 = PD1b \u2212 PD1a (DAVLL error signal)\n"
                 "Output:  WaveGen Channel 1 = sweep + offset + PID feedback\n"
-                "         (feedback acts on lowpass(Ch2) + internal bias)\n"
+                "         (feedback acts on Ch2 + internal bias)\n"
                 "Output is always hard-limited to \u00b15 V, regardless of gain settings.\n"
                 "Engaging the lock turns the sweep OFF and the PID feedback ON."
             ),
@@ -539,17 +532,19 @@ class CoreInstrumentApplication(tk.Tk):
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         # --- Live scope / output readouts ---
-        readout_frame = ttk.LabelFrame(container, text="Live Readouts")
+        readout_frame = ttk.LabelFrame(container, text="Live Scope Traces")
         readout_frame.grid(row=2, column=0, columnspan=2, sticky="we", pady=(0, 12))
-        self.var_scope_ch1_display = tk.StringVar(value="\u2014")
-        self.var_scope_ch2_display = tk.StringVar(value="\u2014")
-        self.var_wavegen_out_display = tk.StringVar(value="\u2014")
-        ttk.Label(readout_frame, text="Scope Ch1 (PD2):").grid(row=0, column=0, sticky="w", padx=6, pady=3)
-        ttk.Label(readout_frame, textvariable=self.var_scope_ch1_display, font=("Consolas", 11)).grid(row=0, column=1, sticky="w", padx=6, pady=3)
-        ttk.Label(readout_frame, text="Scope Ch2 (DAVLL error):").grid(row=1, column=0, sticky="w", padx=6, pady=3)
-        ttk.Label(readout_frame, textvariable=self.var_scope_ch2_display, font=("Consolas", 11)).grid(row=1, column=1, sticky="w", padx=6, pady=3)
-        ttk.Label(readout_frame, text="WaveGen Ch1 output:").grid(row=2, column=0, sticky="w", padx=6, pady=3)
-        ttk.Label(readout_frame, textvariable=self.var_wavegen_out_display, font=("Consolas", 11)).grid(row=2, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(readout_frame, text="Scope Ch1 (PD2, fluorescence/absorption):").grid(
+            row=0, column=0, sticky="w", padx=6, pady=(4, 0)
+        )
+        self.scope_ch1_canvas = tk.Canvas(readout_frame, bg="#000000", height=140, highlightthickness=0)
+        self.scope_ch1_canvas.grid(row=1, column=0, sticky="we", padx=6, pady=(0, 8))
+        ttk.Label(readout_frame, text="Scope Ch2 (PD1b \u2212 PD1a, DAVLL error signal):").grid(
+            row=2, column=0, sticky="w", padx=6, pady=(4, 0)
+        )
+        self.scope_ch2_canvas = tk.Canvas(readout_frame, bg="#000000", height=140, highlightthickness=0)
+        self.scope_ch2_canvas.grid(row=3, column=0, sticky="we", padx=6, pady=(0, 4))
+        readout_frame.columnconfigure(0, weight=1)
 
         # --- Lock on/off ---
         self.var_lock_enabled = tk.BooleanVar(value=False)
@@ -593,7 +588,7 @@ class CoreInstrumentApplication(tk.Tk):
         bias_frame.columnconfigure(0, weight=1)
 
         # --- PID controls ---
-        pid_frame = ttk.LabelFrame(container, text="PID (acts on lowpass(Ch2) + bias)")
+        pid_frame = ttk.LabelFrame(container, text="PID (acts on Ch2 + bias)")
         pid_frame.grid(row=7, column=0, columnspan=2, sticky="we", pady=(0, 10))
 
         ttk.Label(pid_frame, text="Polarity:").grid(row=0, column=0, sticky="w", padx=6, pady=2)
@@ -674,7 +669,6 @@ class CoreInstrumentApplication(tk.Tk):
         ch = self.WAVEGEN_MOD_CHANNEL
         self.ads.analog_out_set_offset(ch, voltage_v)
         self.ads.analog_out_start(ch)
-        self._last_wavegen_out_v = voltage_v
 
     def _sweep_value_v(self, now):
         """
@@ -698,8 +692,8 @@ class CoreInstrumentApplication(tk.Tk):
         Runs a single iteration of the full signal chain and writes the
         result out to WaveGen Ch1:
 
-            Scope Ch2 (error) --lowpass(100 kHz)--> (+) internal bias
-                --> PID --> (+) sweep --> (+) offset --> clamp(+/-5V) --> out
+            Scope Ch2 (error) --> (+) internal bias --> PID
+                --> (+) sweep --> (+) offset --> clamp(+/-5V) --> out
 
         Ch1 (PD2) is only sampled/displayed while unlocked -- see the
         class docstring / build_laser_lock_panel for why.
@@ -710,32 +704,25 @@ class CoreInstrumentApplication(tk.Tk):
         # --- Ch1 (PD2), display-only, skipped entirely while locked ---
         if not locked:
             try:
-                self._last_scope_ch1_v = self.ads.analog_in_read_sample(channel=self.SCOPE_CH1_FLUOR)
+                ch1_v = self.ads.analog_in_read_sample(channel=self.SCOPE_CH1_FLUOR)
             except Exception:
-                self._last_scope_ch1_v = None
+                ch1_v = None
+            self._last_scope_ch1_v = ch1_v
+            if ch1_v is not None:
+                self._scope_ch1_trace.append((now, ch1_v))
         else:
             self._last_scope_ch1_v = None
 
-        # --- Ch2 (DAVLL error): read, apply polarity, lowpass filter ---
+        # --- Ch2 (DAVLL error): read, apply polarity ---
         raw_error_v = self.ads.analog_in_read_sample(channel=self.SCOPE_CH2_ERROR)
         self._last_scope_ch2_v = raw_error_v
+        self._scope_ch2_trace.append((now, raw_error_v))
         sign = -1.0 if self.var_pid_polarity_inverted.get() else 1.0
         error = sign * raw_error_v
 
-        # Single-pole IIR lowpass, cutoff = ERROR_LOWPASS_CUTOFF_HZ, using
-        # the actually-measured dt (see the note in __init__ about why
-        # this can't realize a literal 100 kHz cutoff at USB polling rates).
-        if dt > 0:
-            rc = 1.0 / (2.0 * np.pi * self.ERROR_LOWPASS_CUTOFF_HZ)
-            alpha = dt / (dt + rc)
-        else:
-            alpha = 1.0
-        self._error_lpf_state += alpha * (error - self._error_lpf_state)
-        error_filtered = self._error_lpf_state
-
         # --- Internal bias shifts the PID's zero; live-adjustable ---
         bias_v = self.var_bias_mv.get() / 1000.0
-        error_biased = error_filtered + bias_v
+        error_biased = error + bias_v
 
         # --- PID ---
         g_gain = self.var_pid_g.get()
@@ -817,31 +804,105 @@ class CoreInstrumentApplication(tk.Tk):
 
     def _laser_lock_refresh_display(self):
         """
-        Low-rate (~7 Hz) GUI refresh for the Scope Ch1/Ch2 and WaveGen Ch1
-        live readouts. Runs on the main thread via self.after and only
-        ever reads the plain float/None attributes written by the
-        background loop thread -- it never touches self.ads directly, so
-        it can't race with that thread.
+        Low-rate (~7 Hz) GUI refresh for the Scope Ch1/Ch2 rolling-trace
+        plots. Runs on the main thread via self.after and only ever reads
+        list() snapshots of the deques written by the background loop
+        thread -- it never touches self.ads directly, so it can't race
+        with that thread.
         """
         if not getattr(self, "_laser_lock_gui_alive", False):
             return
         try:
-            if self._last_scope_ch1_v is None:
-                self.var_scope_ch1_display.set(
-                    "\u2014 (not sampled while locked)" if self.var_lock_enabled.get() else "\u2014"
-                )
-            else:
-                self.var_scope_ch1_display.set(f"{self._last_scope_ch1_v:+.4f} V")
-
-            if self._last_scope_ch2_v is None:
-                self.var_scope_ch2_display.set("\u2014")
-            else:
-                self.var_scope_ch2_display.set(f"{self._last_scope_ch2_v:+.4f} V")
-
-            self.var_wavegen_out_display.set(f"{self._last_wavegen_out_v:+.4f} V")
+            ch1_note = "not sampled while locked" if self.var_lock_enabled.get() else None
+            self._draw_live_scope_canvas(self.scope_ch1_canvas, list(self._scope_ch1_trace), ch1_note)
+            self._draw_live_scope_canvas(self.scope_ch2_canvas, list(self._scope_ch2_trace), None)
         except Exception:
             pass
         self.after(150, self._laser_lock_refresh_display)
+
+    def _draw_live_scope_canvas(self, canvas, data_points, title_note=None):
+        """
+        Renders a rolling voltage-vs-time trace onto the given tk.Canvas
+        from a list of (t, v) tuples (oldest first). Styled the same as
+        render_oscilloscope_canvas_trace, adapted for a continuously
+        updating rolling buffer instead of a single fixed-length capture.
+        """
+        canvas.delete("all")
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 10 or h < 10:
+            w, h = 360, 140
+
+        LEFT_MARGIN, RIGHT_MARGIN, TOP_MARGIN, BOTTOM_MARGIN = 55, 12, 10, 26
+        plot_x0, plot_x1 = LEFT_MARGIN, w - RIGHT_MARGIN
+        plot_y0, plot_y1 = TOP_MARGIN, h - BOTTOM_MARGIN
+        plot_w, plot_h = plot_x1 - plot_x0, plot_y1 - plot_y0
+        if plot_w <= 0 or plot_h <= 0:
+            return
+
+        has_data = data_points is not None and len(data_points) >= 2
+        if has_data:
+            times = [p[0] for p in data_points]
+            values = [p[1] for p in data_points]
+            t0, t1 = times[0], times[-1]
+            span_t = (t1 - t0) if (t1 - t0) > 1e-6 else 1.0
+            v_min, v_max = min(values), max(values)
+        else:
+            t0, span_t = 0.0, 1.0
+            v_min, v_max = 0.0, 1.0
+        span_v = (v_max - v_min) if (v_max - v_min) > 0.01 else 1.0
+
+        mid_y = plot_y0 + plot_h / 2
+        canvas.create_line(plot_x0, mid_y, plot_x1, mid_y, fill="#222222")
+
+        # --- Y axis (voltage) ---
+        canvas.create_line(plot_x0, plot_y0, plot_x0, plot_y1, fill="#555555", width=1)
+        n_y_ticks = 4
+        for i in range(n_y_ticks + 1):
+            frac = i / n_y_ticks
+            y_val = v_max - frac * span_v
+            y_pix = plot_y0 + frac * plot_h
+            canvas.create_line(plot_x0 - 4, y_pix, plot_x0, y_pix, fill="#555555")
+            canvas.create_text(
+                plot_x0 - 6, y_pix, text=f"{y_val:.3f}V", fill="#888888",
+                font=("Arial", 8), anchor="e",
+            )
+        canvas.create_text(12, plot_y0 - 2, text="V", fill="#888888", font=("Arial", 8), anchor="nw")
+
+        # --- X axis (seconds ago, 0 = now) ---
+        canvas.create_line(plot_x0, plot_y1, plot_x1, plot_y1, fill="#555555", width=1)
+        n_x_ticks = 4
+        for i in range(n_x_ticks + 1):
+            frac = i / n_x_ticks
+            x_pix = plot_x0 + frac * plot_w
+            canvas.create_line(x_pix, plot_y1, x_pix, plot_y1 + 4, fill="#555555")
+            t_val = -(1.0 - frac) * span_t
+            anchor = "n" if i not in (0, n_x_ticks) else ("nw" if i == 0 else "ne")
+            canvas.create_text(
+                x_pix, plot_y1 + 6, text=f"{t_val:.2f}s", fill="#888888",
+                font=("Arial", 8), anchor=anchor,
+            )
+        canvas.create_text(plot_x1, h - 4, text="Time", fill="#888888", font=("Arial", 8), anchor="se")
+
+        if title_note:
+            canvas.create_text(
+                plot_x0 + 4, plot_y0 + 2, text=title_note, fill="#ffaa00",
+                font=("Arial", 8, "italic"), anchor="nw",
+            )
+
+        if not has_data:
+            return
+
+        points = []
+        for (t, v) in data_points:
+            x_pixel = plot_x0 + ((t - t0) / span_t) * plot_w
+            y_pixel = plot_y1 - ((v - v_min) / span_v) * plot_h
+            points.append((x_pixel, y_pixel))
+        flat_points = [coord for pt in points for coord in pt]
+        canvas.create_line(flat_points, fill="#00ff00", width=1.2)
+
+        canvas.create_text(plot_x1 - 4, plot_y0 + 10, text=f"Max: {v_max:.3f} V", fill="#888888", font=("Arial", 8), anchor="e")
+        canvas.create_text(plot_x1 - 4, plot_y1 - 10, text=f"Min: {v_min:.3f} V", fill="#888888", font=("Arial", 8), anchor="e")
 
     # =========================================================================
     # PANEL BUILDERS & LOGIC SECTIONS
