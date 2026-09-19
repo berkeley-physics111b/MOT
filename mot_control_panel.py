@@ -16,7 +16,8 @@ from waveforms_ads import (
     DwfDigitalOutIdleLow, DwfDigitalOutIdleHigh,
     DwfStateDone,
     trigsrcDigitalOut,
-    funcDC, AnalogOutNodeCarrier,
+    trigtypeEdge, DwfTriggerSlopeRise,
+    funcDC, funcTriangle, AnalogOutNodeCarrier,
 )
 from allied_vision_camera import AlliedVisionCamera, CameraConfig, HardwareTriggerConfig, TriggerActivation, TriggerSelector, AcquisitionMode
 
@@ -126,6 +127,19 @@ class CoreInstrumentApplication(tk.Tk):
         self.SCOPE_CH2_ERROR = 1
         self.WAVEGEN_MOD_CHANNEL = 0
 
+        # waveforms_ads.py's trigger-source constant block stops at
+        # trigsrcDigitalOut (6) and skips straight to trigsrcExternal1
+        # (11) -- it never named the AnalogOut trigger sources, even
+        # though the underlying DWF library supports them and
+        # analog_in_set_trigger_source() passes any int straight through
+        # to FDwfAnalogInTriggerSourceSet unvalidated. This is the same
+        # "raw DWF protocol value, not worth a wrapper constant" pattern
+        # already used for the trigger type/condition in
+        # execute_synch_pulse_routine (edge=0, rising=0). Value taken
+        # from dwf.h (TRIGSRC_ANALOG_OUT1).
+        TRIGSRC_ANALOG_OUT1 = 7
+        self.TRIGSRC_ANALOG_OUT1 = TRIGSRC_ANALOG_OUT1
+
         # Live scope readings, written only by the background loop thread
         # and read only by the polling GUI refresh callback below -- a
         # plain float/None assignment is atomic under the GIL, so no extra
@@ -151,8 +165,45 @@ class CoreInstrumentApplication(tk.Tk):
         self._pid_last_error = 0.0
         self._pid_last_time = None
 
-        # Reference time base for the software-generated sweep waveform.
-        self._sweep_t0 = time.perf_counter()
+        # Hard cap on how fast the modulation output (WaveGen Ch1) is
+        # allowed to change, regardless of PID gain settings -- applied
+        # as the very last step before every write, in
+        # _laser_lock_step_locked. Set this to whatever your laser/piezo
+        # can actually tolerate.
+        self.MAX_MOD_SLEW_V_PER_S = 2.0
+        self._last_mod_output_v = 0.0
+
+        # Serializes ALL self.ads access between the laser-lock loop
+        # thread (below) and the main MOT tab's pulse-sequence worker
+        # thread (sequence_execution_worker). RLock because several
+        # laser-lock helper methods call each other while already
+        # holding it (e.g. _laser_lock_arm_wavegen_channel ->
+        # _laser_lock_enter_sweep_mode -> _apply_sweep_params_locked).
+        #
+        # This does not, by itself, stop the laser-lock loop from
+        # cancelling a pulse-engine scope acquisition that's armed and
+        # waiting for its DIO trigger -- analog_in_read_sample()'s
+        # internal FDwfAnalogInConfigure(hdwf, 0, 0) call can still
+        # de-arm that acquisition even if the two calls never overlap in
+        # time, simply by both having run against the same instrument.
+        # The actual fix for that is behavioral: _laser_lock_step checks
+        # self._sequence_running and skips touching self.ads entirely
+        # for the duration of a pulse sequence. The lock guards against
+        # everything else (e.g. one thread's multi-call reconfigure
+        # sequence being interleaved with another thread's).
+        self._ads_lock = threading.RLock()
+
+        # Sweep-triggered scope acquisition state (unlocked mode only --
+        # see _laser_lock_step_unlocked / _laser_lock_configure_sweep_scope).
+        self._scope_sweep_armed = False
+        self._configured_sweep_freq_hz = None
+        self._sweep_scope_sample_rate = None
+        self._sweep_scope_buffer_samples = None
+
+        # Tracks the last (freq, amp, offset) pushed to the WaveGen sweep
+        # so _apply_sweep_params_locked only touches hardware when the
+        # user actually changes a value, instead of every loop tick.
+        self._last_sweep_params = None
 
         self._laser_lock_loop_period_s = 0.002  # best-effort ~500 Hz update rate
         # Signaled on app shutdown so the loop thread stops touching
@@ -449,7 +500,7 @@ class CoreInstrumentApplication(tk.Tk):
         self.main_notebook.add(self.main_tab, text="Main Control")
 
         self.laser_lock_tab = ttk.Frame(self.main_notebook)
-        self.main_notebook.add(self.laser_lock_tab, text="Laser Lock (Scope Ch1/Ch2 \u2192 WaveGen Ch1)")
+        self.main_notebook.add(self.laser_lock_tab, text="Laser Lock")
         self.build_laser_lock_panel(self.laser_lock_tab)
 
         self.main_vertical_pane = ttk.PanedWindow(self.main_tab, orient="vertical")
@@ -646,75 +697,200 @@ class CoreInstrumentApplication(tk.Tk):
         self._pid_last_time = None
 
     def _laser_lock_arm_wavegen_channel(self):
-        """Claims the WaveGen modulation channel and starts it at 0 V."""
+        """Claims the WaveGen modulation channel and starts it in the
+        default (unlocked) hardware-triangle sweep mode -- see
+        _laser_lock_enter_sweep_mode."""
         ch = self.WAVEGEN_MOD_CHANNEL
-        self.ads.analog_out_reset(ch)
-        self.ads.analog_out_enable_node(ch, AnalogOutNodeCarrier, 1)
-        self.ads.analog_out_set_function(ch, funcDC)
-        self.ads.analog_out_set_offset(ch, 0.0)
-        self.ads.analog_out_start(ch)
+        with self._ads_lock:
+            self.ads.analog_out_reset(ch)
+            self.ads.analog_out_enable_node(ch, AnalogOutNodeCarrier, 1)
+            self._laser_lock_enter_sweep_mode()
 
     def _laser_lock_disarm_wavegen_channel(self):
         """Forces the modulation output back to 0 V and stops the generator."""
         ch = self.WAVEGEN_MOD_CHANNEL
         try:
-            self.ads.analog_out_set_offset(ch, 0.0)
-            self.ads.analog_out_start(ch)  # push the 0 V update before stopping
-            self.ads.analog_out_stop(ch)
+            with self._ads_lock:
+                self.ads.analog_out_set_function(ch, funcDC)
+                self.ads.analog_out_set_offset(ch, 0.0)
+                self.ads.analog_out_start(ch)  # push the 0 V update before stopping
+                self.ads.analog_out_stop(ch)
         except Exception as e:
             print(f"[Laser Lock] Could not disarm WaveGen channel cleanly: {e}")
 
-    def _set_laser_lock_wavegen_output(self, voltage_v):
-        """Updates the live modulation output voltage (already clamped by the caller)."""
+    def _laser_lock_enter_sweep_mode(self):
+        """
+        Switches WaveGen Ch1 to a hardware-generated triangle wave instead
+        of the old approach of bit-banging a funcDC offset from Python at
+        ~500 Hz. That software approach was the source of the sweep
+        ripple/jitter: at a 10 Hz sweep, 500 Hz only gives ~50 updates per
+        cycle, so ordinary host scheduling jitter (GIL contention with the
+        Tk mainloop, live-view thread, etc.) eats a large fraction of a
+        sample period and shows up as an uneven triangle. The hardware
+        generator free-runs on the AWG's own clock once started, so it's
+        immune to host timing entirely -- the host now only needs to
+        touch it when the user actually changes frequency/amplitude/
+        offset (see _apply_sweep_params_locked), not every loop tick.
+
+        Also (re)claims the AnalogIn scope for this tab and triggers both
+        channels off this sweep output -- see
+        _laser_lock_configure_sweep_scope. Must be called while holding
+        self._ads_lock.
+        """
         ch = self.WAVEGEN_MOD_CHANNEL
-        self.ads.analog_out_set_offset(ch, voltage_v)
+        self.ads.analog_out_set_function(ch, funcTriangle)
+        self.ads.analog_out_set_symmetry(ch, 50.0)  # symmetric ramp up/down
+        self._last_sweep_params = None
+        self._apply_sweep_params_locked(force=True)
         self.ads.analog_out_start(ch)
+        self._scope_sweep_armed = False  # (re)configured lazily, see below
 
-    def _sweep_value_v(self, now):
+    def _apply_sweep_params_locked(self, force=False):
         """
-        Software-generated symmetric triangle wave, amplitude/frequency
-        taken live from the GUI. Uses an absolute time base so changing
-        frequency/amplitude on the fly doesn't require any extra state --
-        a frequency change just produces a phase discontinuity, the same
-        as retuning a hardware function generator.
+        Pushes the GUI's sweep frequency/amplitude/offset to the AWG only
+        when they've actually changed (or force=True). Must be called
+        while holding self._ads_lock. Returns True if anything was
+        written, so the caller can decide whether the scope acquisition
+        (which is sized off the sweep period) also needs reconfiguring.
         """
-        freq_hz = self.var_sweep_freq_hz.get()
+        ch = self.WAVEGEN_MOD_CHANNEL
+        freq_hz = max(self.var_sweep_freq_hz.get(), 1e-3)
         amp_v = self.var_sweep_amp_v.get()
-        if freq_hz <= 0:
-            return 0.0
-        phase = (now - self._sweep_t0) * freq_hz
-        frac = phase - np.floor(phase)
-        tri = 2.0 * abs(2.0 * (frac - np.floor(frac + 0.5))) - 1.0  # triangle in [-1, 1]
-        return float(amp_v * tri)
+        offset_v = self.var_offset_mv.get() / 1000.0
+        params = (freq_hz, amp_v, offset_v)
+        if not force and params == self._last_sweep_params:
+            return False
+        self.ads.analog_out_set_frequency(ch, freq_hz)
+        self.ads.analog_out_set_amplitude(ch, amp_v)
+        self.ads.analog_out_set_offset(ch, offset_v)
+        self.ads.analog_out_start(ch)
+        self._last_sweep_params = params
+        return True
 
-    def _laser_lock_step(self, now, locked):
+    def _laser_lock_enter_lock_mode(self):
         """
-        Runs a single iteration of the full signal chain and writes the
-        result out to WaveGen Ch1:
+        Switches WaveGen Ch1 from the hardware sweep to a host-computed
+        DC output (PID feedback has to be computed on the host, so this
+        path is necessarily a software bit-bang -- see
+        _laser_lock_step_locked). Must be called while holding
+        self._ads_lock.
+
+        Also relinquishes the AnalogIn scope trigger: from this point on
+        the laser-lock loop must not call analog_in_set_trigger_source /
+        analog_in_configure at all, so the main MOT tab's DIO-triggered
+        pulse-engine acquisition (execute_synch_pulse_routine) owns it
+        undisturbed, per the tab's own docstring.
+        """
+        ch = self.WAVEGEN_MOD_CHANNEL
+        self.ads.analog_out_set_function(ch, funcDC)
+        self.ads.analog_out_set_offset(ch, 0.0)
+        self.ads.analog_out_start(ch)
+        # We don't know exactly where in its cycle the hardware triangle
+        # was at the instant of the switch, so there's no way to make the
+        # DC output "continuous" with it. Reset the slew-limiter's
+        # reference to 0 V and let it ramp smoothly from there on the
+        # first locked tick, same as the existing PID/integrator reset on
+        # this same transition.
+        self._last_mod_output_v = 0.0
+        self._scope_sweep_armed = False
+
+    def _laser_lock_configure_sweep_scope(self):
+        """
+        (Re)configures the AnalogIn instrument for a repeated,
+        single-capture-per-trigger acquisition of both scope channels,
+        triggered on the rising edge of the WaveGen sweep output
+        (TRIGSRC_ANALOG_OUT1) -- this is what "both scope channels
+        trigger on the wavegen output" means in DWF terms: the AnalogIn
+        instrument has one trigger source for both channels, not an
+        independent trigger per channel, so both channels are always
+        captured together off whichever single source is configured.
+
+        Must be called while holding self._ads_lock, and never while
+        self._sequence_running (checked by the caller) -- the main tab
+        owns this same instrument during a pulse sequence.
+        """
+        freq_hz = max(self.var_sweep_freq_hz.get(), 1e-3)
+        period_s = 1.0 / freq_hz
+        # ~200 samples per sweep period, clamped to a sane range so a
+        # very slow or very fast sweep doesn't ask for a silly buffer.
+        sample_rate = max(2_000.0, min(200_000.0, 200.0 / period_s))
+        buffer_samples = max(64, min(8192, int(sample_rate * period_s)))
+
+        self.ads.analog_in_reset()
+        self.ads.analog_in_channel_enable(self.SCOPE_CH1_FLUOR, True)
+        self.ads.analog_in_channel_enable(self.SCOPE_CH2_ERROR, True)
+        self.ads.analog_in_set_sample_rate(sample_rate)
+        self.ads.analog_in_set_buffer_size(buffer_samples)
+        self.ads.analog_in_set_trigger_source(self.TRIGSRC_ANALOG_OUT1)
+        self.ads.analog_in_set_trigger_type(trigtypeEdge)
+        self.ads.analog_in_set_trigger_condition(DwfTriggerSlopeRise)
+        self.ads.analog_in_configure(reconfigure=True, start=True)
+
+        self._configured_sweep_freq_hz = freq_hz
+        self._sweep_scope_sample_rate = sample_rate
+        self._sweep_scope_buffer_samples = buffer_samples
+        self._scope_sweep_armed = True
+
+    def _laser_lock_step_unlocked(self, now):
+        """
+        Unlocked (sweeping) tick: no PID, no per-tick WaveGen write -- the
+        sweep is entirely hardware-generated (see
+        _laser_lock_enter_sweep_mode). This just (a) pushes any live GUI
+        sweep-parameter changes to the AWG, and (b) pulls the next
+        triggered scope buffer, once per sweep cycle, for the Ch1/Ch2
+        trace display.
+        """
+        with self._ads_lock:
+            self._apply_sweep_params_locked()
+            freq_hz = max(self.var_sweep_freq_hz.get(), 1e-3)
+            freq_changed = (self._configured_sweep_freq_hz is None
+                             or abs(freq_hz - self._configured_sweep_freq_hz) > 1e-9)
+            if (not self._scope_sweep_armed) or freq_changed:
+                self._laser_lock_configure_sweep_scope()
+                return  # capture just (re)armed; data arrives on a later tick
+
+            status = self.ads.analog_in_status(read_data=True)
+            if status != DwfStateDone:
+                return  # sweep hasn't completed a cycle yet -- nothing new
+
+            n = self._sweep_scope_buffer_samples
+            ch1_buf = self.ads.analog_in_get_data(self.SCOPE_CH1_FLUOR, n)
+            ch2_buf = self.ads.analog_in_get_data(self.SCOPE_CH2_ERROR, n)
+            # Re-arm immediately for the next sweep cycle (reconfigure=False
+            # keeps the existing trigger/rate/buffer settings -- no need to
+            # redo the full setup every cycle).
+            self.ads.analog_in_configure(reconfigure=False, start=True)
+
+        # Decimate into the rolling display buffers (which cap at
+        # SCOPE_TRACE_MAXLEN anyway) rather than pushing all n samples.
+        t_step = 1.0 / self._sweep_scope_sample_rate
+        stride = max(1, n // 100)
+        for i in range(0, n, stride):
+            t_i = now - (n - i) * t_step
+            self._scope_ch1_trace.append((t_i, float(ch1_buf[i])))
+            self._scope_ch2_trace.append((t_i, float(ch2_buf[i])))
+        self._last_scope_ch1_v = float(ch1_buf[-1])
+        self._last_scope_ch2_v = float(ch2_buf[-1])
+
+    def _laser_lock_step_locked(self, now, dt):
+        """
+        Locked (feedback) tick:
 
             Scope Ch2 (error) --> (+) internal bias --> PID
-                --> (+) sweep --> (+) offset --> clamp(+/-5V) --> out
+                --> (+) offset --> clamp(+/-5V) --> slew-limit --> out
 
-        Ch1 (PD2) is only sampled/displayed while unlocked -- see the
-        class docstring / build_laser_lock_panel for why.
+        Ch1 (PD2) is not sampled at all while locked -- freed up for the
+        main MOT tab, which owns the AnalogIn trigger during this state.
         """
-        dt = (now - self._pid_last_time) if self._pid_last_time is not None else 0.0
-        self._pid_last_time = now
+        self._last_scope_ch1_v = None
 
-        # --- Ch1 (PD2), display-only, skipped entirely while locked ---
-        if not locked:
-            try:
-                ch1_v = self.ads.analog_in_read_sample(channel=self.SCOPE_CH1_FLUOR)
-            except Exception:
-                ch1_v = None
-            self._last_scope_ch1_v = ch1_v
-            if ch1_v is not None:
-                self._scope_ch1_trace.append((now, ch1_v))
-        else:
-            self._last_scope_ch1_v = None
-
-        # --- Ch2 (DAVLL error): read, apply polarity ---
-        raw_error_v = self.ads.analog_in_read_sample(channel=self.SCOPE_CH2_ERROR)
+        # --- Ch2 (DAVLL error): read, apply polarity. Safe to use the
+        # immediate-sample idiom here because self._sequence_running is
+        # checked by the caller before we ever get here -- the main tab's
+        # DIO-triggered acquisition, if any, is never in flight while
+        # this runs.
+        with self._ads_lock:
+            raw_error_v = self.ads.analog_in_read_sample(channel=self.SCOPE_CH2_ERROR)
         self._last_scope_ch2_v = raw_error_v
         self._scope_ch2_trace.append((now, raw_error_v))
         sign = -1.0 if self.var_pid_polarity_inverted.get() else 1.0
@@ -735,28 +911,53 @@ class CoreInstrumentApplication(tk.Tk):
         pid_raw = g_gain * (p_gain * error_biased + i_gain * trial_integral + d_gain * derivative)
         self._pid_last_error = error_biased
 
-        # --- Sum: feedback (locked) or sweep (unlocked), plus offset ---
         offset_v = self.var_offset_mv.get() / 1000.0
-        if locked:
-            feedback_term = pid_raw
-            sweep_term = 0.0
-        else:
-            feedback_term = 0.0
-            sweep_term = self._sweep_value_v(now)
-
-        raw_sum = feedback_term + sweep_term + offset_v
+        raw_sum = pid_raw + offset_v
         output = max(-5.0, min(5.0, raw_sum))
+        pre_slew_output = output
+
+        # --- Hard slew-rate limit, independent of gain settings ---
+        if dt > 0:
+            max_step = self.MAX_MOD_SLEW_V_PER_S * dt
+            output = max(self._last_mod_output_v - max_step,
+                         min(self._last_mod_output_v + max_step, output))
+        self._last_mod_output_v = output
 
         # Simple clamped-integrator anti-windup: only fold the new integral
-        # term in (and only while locked) if doing so didn't require
-        # clipping the output. This keeps a long-saturated error from
-        # leaving behind a huge integral that then overshoots wildly once
-        # the loop recovers, and keeps the integrator from accumulating at
-        # all while unlocked (it's reset on re-lock anyway, see below).
-        if locked and raw_sum == output:
+        # term in if doing so didn't require clipping against either the
+        # +/-5V hard limit OR the slew limit -- a long-saturated or
+        # rate-limited error shouldn't leave behind a huge integral that
+        # then overshoots wildly once the loop recovers.
+        if raw_sum == pre_slew_output == output:
             self._pid_integral = trial_integral
 
-        self._set_laser_lock_wavegen_output(output)
+        ch = self.WAVEGEN_MOD_CHANNEL
+        with self._ads_lock:
+            self.ads.analog_out_set_offset(ch, output)
+            self.ads.analog_out_start(ch)
+
+    def _laser_lock_step(self, now, locked):
+        """Dispatches to the unlocked (sweep) or locked (PID) tick. See
+        _laser_lock_step_unlocked / _laser_lock_step_locked."""
+        if self._sequence_running:
+            # The main MOT tab's pulse engine owns self.ads right now --
+            # it has (or is about to have) a DIO-triggered scope
+            # acquisition armed and waiting, and analog_in_read_sample()'s
+            # internal FDwfAnalogInConfigure(hdwf, 0, 0) call can de-arm
+            # that acquisition if it runs while the pulse engine is
+            # waiting on it. Freeze this loop entirely for the duration
+            # rather than touch self.ads at all -- see
+            # execute_synch_pulse_routine.
+            self._pid_last_time = now  # keep dt sane on resume
+            return
+
+        dt = (now - self._pid_last_time) if self._pid_last_time is not None else 0.0
+        self._pid_last_time = now
+
+        if locked:
+            self._laser_lock_step_locked(now, dt)
+        else:
+            self._laser_lock_step_unlocked(now)
 
     def _laser_lock_loop_worker(self):
         """
@@ -784,15 +985,27 @@ class CoreInstrumentApplication(tk.Tk):
                 if armed:
                     locked = bool(self.var_lock_enabled.get())
 
-                    if locked and not prev_locked:
+                    if locked and not prev_locked and not self._sequence_running:
                         # Rising edge: clear the integrator so a stale
                         # accumulation from a previous lock attempt
-                        # doesn't cause a jump the moment it re-engages.
+                        # doesn't cause a jump the moment it re-engages,
+                        # and switch the WaveGen/scope over to lock mode.
                         self._pid_integral = 0.0
                         self._pid_last_error = 0.0
-                    prev_locked = locked
+                        with self._ads_lock:
+                            self._laser_lock_enter_lock_mode()
+                        prev_locked = True
+                    elif not locked and prev_locked and not self._sequence_running:
+                        with self._ads_lock:
+                            self._laser_lock_enter_sweep_mode()
+                        prev_locked = False
+                    elif not self._sequence_running:
+                        prev_locked = locked
+                    # else: a pulse sequence owns self.ads right now --
+                    # defer the mode switch until it's done, rather than
+                    # reconfigure hardware out from under it.
 
-                    self._laser_lock_step(time.perf_counter(), locked)
+                    self._laser_lock_step(time.perf_counter(), prev_locked)
             except Exception as e:
                 print(f"[Laser Lock Loop Error] {e}")
             time.sleep(self._laser_lock_loop_period_s)
@@ -1897,17 +2110,27 @@ class CoreInstrumentApplication(tk.Tk):
 
                 # 3. NOW arm the oscilloscope (after digital_out is already
                 # programmed and running, so no subsequent reset can hit it).
+                #
+                # self._sequence_running was already set True above (top of
+                # execute_synch_pulse_routine), before this worker thread
+                # was started -- the laser-lock loop checks that flag and
+                # skips all self.ads access for as long as it's set, so
+                # this acquisition can't be de-armed by a concurrent
+                # analog_in_read_sample() call from that thread the way it
+                # could before. self._ads_lock is still held here too, as
+                # a second line of defense against any other future caller.
                 if self.ads:
-                    self.ads.analog_in_reset()
-                    self.ads.analog_in_channel_enable(channel=0, enable=True)
-                    self.ads.analog_in_set_sample_rate(scope_sample_rate)
-                    self.ads.analog_in_set_buffer_size(scope_buffer_samples)
-                    # Trigger on the rising edge of the Digital Out bus
-                    self.ads.analog_in_set_trigger_source(trigsrcDigitalOut)
-                    self.ads.analog_in_set_trigger_type(0)       # edge
-                    self.ads.analog_in_set_trigger_condition(0)  # rising
-                    self.ads.analog_in_set_trigger_position(0.5*scope_buffer_samples/scope_sample_rate) # put trigger at start of buffer
-                    self.ads.analog_in_configure(reconfigure=True, start=True)
+                    with self._ads_lock:
+                        self.ads.analog_in_reset()
+                        self.ads.analog_in_channel_enable(channel=0, enable=True)
+                        self.ads.analog_in_set_sample_rate(scope_sample_rate)
+                        self.ads.analog_in_set_buffer_size(scope_buffer_samples)
+                        # Trigger on the rising edge of the Digital Out bus
+                        self.ads.analog_in_set_trigger_source(trigsrcDigitalOut)
+                        self.ads.analog_in_set_trigger_type(0)       # edge
+                        self.ads.analog_in_set_trigger_condition(0)  # rising
+                        self.ads.analog_in_set_trigger_position(0.5*scope_buffer_samples/scope_sample_rate) # put trigger at start of buffer
+                        self.ads.analog_in_configure(reconfigure=True, start=True)
                     print(f"[Pulse Engine] Oscilloscope armed: {scope_buffer_samples} "
                           f"samples @ {scope_sample_rate/1e3:.0f} kHz")
 
@@ -1952,11 +2175,13 @@ class CoreInstrumentApplication(tk.Tk):
                 if self.ads:
                     timeout_limit = time.time() + 5.0
                     while True:
-                        status = self.ads.analog_in_status(read_data=True)
+                        with self._ads_lock:
+                            status = self.ads.analog_in_status(read_data=True)
+                            if status == 2:  # DwfStateDone
+                                scope_voltages = self.ads.analog_in_get_data(
+                                    channel=0, n_samples=scope_buffer_samples
+                                )
                         if status == 2:  # DwfStateDone
-                            scope_voltages = self.ads.analog_in_get_data(
-                                channel=0, n_samples=scope_buffer_samples
-                            )
                             print(f"[Pulse Engine] Scope captured {len(scope_voltages)} samples, "
                                   f"range [{scope_voltages.min():.3f}, {scope_voltages.max():.3f}] V")
                             break
